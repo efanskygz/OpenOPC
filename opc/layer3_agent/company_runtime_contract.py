@@ -95,7 +95,7 @@ _COMPANY_EXECUTE_WORK_ITEM_GUIDELINES = """
 _COMPANY_REVIEW_WORK_ITEM_GUIDELINES = """
 ## Company Work Item Turn: Review
 
-You are reviewing a subordinate's deliverable. The runtime applies your verdict mechanically — approve sends the work to done, reject sends it back to the worker with your summary + blocking_issues as rework feedback. The runtime does NOT second-guess the shape or content of your verdict; you are responsible for the call.
+You are reviewing a subordinate's deliverable. The runtime applies your verdict mechanically — approve sends the work to done, reject sends it back to the worker with your summary + blocking_issues as rework feedback. You are responsible for the decision. A reject must contain a concrete reason in summary or specific blocking_issues. Missing reasons produce a reviewer output error and retry this reviewer; they never send the worker for blind rework.
 
 ### How to judge
 - You have read access to the workspace. Use your tools (file_read, bash, git_*, web_search, etc.) to verify the worker's claims against the actual current state. Don't trust the handoff blindly and don't reject blindly either.
@@ -165,7 +165,7 @@ _REVIEW_PENDING_HEADER = """
   Approve: `{"review_verdict":"approve","summary":"<concrete reason>"}`
   Reject:  `{"review_verdict":"reject","summary":"<reason>","blocking_issues":["<specific fix>"],"followups":["<nice-to-have>"]}`
 
-The runtime applies the verdict mechanically. For rejections, name specific files / tests / artifacts in `blocking_issues` so the worker can act on your feedback.
+The runtime applies valid verdicts mechanically; a reject without a reason or blocking correction is returned to the reviewer for regeneration. For rejections, name specific files / tests / artifacts in `blocking_issues` so the worker can act on your feedback.
 
 - If a review depends on information you lack (e.g., evidence from another team), send a targeted `send_dm` or `ask_peer_and_wait` message rather than approving blindly.
 - Do NOT approve simply to unblock the pipeline; reject with specific, actionable feedback if acceptance criteria are not met.
@@ -194,7 +194,7 @@ End your turn with one JSON object on its own line:
   Approve: `{"review_verdict":"approve","summary":"<concrete reason it meets the bar>"}`
   Reject:  `{"review_verdict":"reject","summary":"<overall reason>","blocking_issues":["<specific change needed>"],"followups":["<non-blocking improvement>"]}`
 
-The runtime applies your verdict mechanically — approve moves the child to done, reject sends it back to the worker with your summary + blocking_issues as rework feedback. The runtime does NOT second-guess the shape or content of your verdict. You are responsible for the call.
+The runtime applies your verdict mechanically — approve moves the child to done, reject sends it back to the worker with your summary + blocking_issues as rework feedback. You are responsible for the decision. A reject must contain a concrete reason in summary or specific blocking_issues. Missing reasons produce a reviewer output error and retry this reviewer; they never send the worker for blind rework.
 
 If your output cannot be parsed into approve or reject, the runtime will give you one more review attempt with a parse-failure hint, and after that it will escalate to a human reviewer. So please emit a clear label.
 """.strip()

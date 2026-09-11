@@ -542,12 +542,8 @@ class VerdictParseRetryTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await store.close()
 
-    async def test_parseable_reject_with_no_issues_still_applies(self) -> None:
-        # The runtime no longer second-guesses verdict shape. A reject
-        # with empty blocking_issues / followups is mechanically applied
-        # as rework — the reviewer was trusted to produce it. (This is
-        # the behavioural inverse of the old _verdict_is_actionable
-        # path which would have salvaged or degraded.)
+    async def test_bare_reject_retries_reviewer_without_worker_rework(self) -> None:
+        # Missing reasons are the reviewer's error, never worker rework.
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             store = OPCStore(root / "tasks.db")
@@ -571,11 +567,15 @@ class VerdictParseRetryTests(unittest.IsolatedAsyncioTestCase):
                 await executor._finalize_review_work_item(review_task)
 
                 child_after = await store.get_delegation_work_item("wi-child")
-                self.assertEqual(child_after.phase, Phase.READY_FOR_REWORK)
+                self.assertEqual(child_after.phase, Phase.AWAITING_MANAGER_REVIEW)
                 self.assertEqual(
                     int(child_after.metadata.get("review_rework_count", 0)),
-                    1,
+                    0,
                 )
+                retry = await store.get_delegation_work_item(review_work_item_id_for_attempt("wi-child", 2))
+                self.assertEqual(retry.role_id, "cto")
+                self.assertIn("REVIEW_REJECT_FEEDBACK_MISSING", retry.metadata["review_retry_hint"])
+                self.assertEqual(retry.metadata["review_retry_reason"], "reject_feedback_missing")
                 # Audit fields from the old salvage/degrade path must
                 # NOT be set — that whole machinery is gone.
                 self.assertNotIn(

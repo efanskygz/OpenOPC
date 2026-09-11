@@ -434,6 +434,11 @@ class NativeAgent:
             task,
             include_previous_submission=False,
         )
+        build_review_retry = getattr(self.context_assembler, "build_review_retry_context", None)
+        review_retry = await build_review_retry(task) if callable(build_review_retry) else ""
+        review_retry = review_retry if isinstance(review_retry, str) else ""
+        if review_retry:
+            rework_feedback = review_retry
         if not rework_feedback:
             task.metadata.pop("_runtime_v2_attempt_user_seed_required", None)
             task.metadata.pop("_runtime_v2_attempt_user_seed_revision", None)
@@ -475,8 +480,10 @@ class NativeAgent:
                 turn_mode,
                 rework_feedback,
                 (
-                    "Apply the correction now using the available tools. Do not "
-                    "resubmit an unchanged artifact."
+                    "Regenerate your review verdict with the missing reason or blocking corrections. "
+                    "Do not edit the worker's deliverable or change your decision merely to bypass validation."
+                    if review_retry else
+                    "Apply the correction now using the available tools. Do not resubmit an unchanged artifact."
                 ),
             )
             if str(part or "").strip()

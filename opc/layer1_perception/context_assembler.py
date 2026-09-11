@@ -355,6 +355,31 @@ class ContextAssembler:
             supplemental_metadata=task.metadata,
         )
 
+    async def build_review_retry_context(self, task: Task) -> str:
+        metadata = dict(task.metadata or {})
+        if not (
+            metadata.get("review_execution_work_item") or metadata.get("review_task")
+            or turn_type_for_task(task, fallback="") == "review"
+            or (task.context_snapshot or {}).get("review_output_retry")
+        ):
+            return ""
+        if await self._infer_turn_mode(task) != TurnMode.REVIEW:
+            return ""
+        work_item = await self._load_task_work_item(task)
+        metadata = dict(work_item.metadata or {}) if work_item is not None else dict(task.metadata or {})
+        hint = str(metadata.get("review_retry_hint", "") or "").strip()
+        retry = (task.context_snapshot or {}).get("review_output_retry", {})
+        # Legacy review gates retry their own task, not a new auxiliary card.
+        # Their saved correction must match the exact reviewer and WorkItem.
+        if (
+            isinstance(retry, dict)
+            and retry.get("task_id") == task.id
+            and retry.get("role_id") == task.assigned_to
+            and retry.get("work_item_id", "") == linked_work_item_id_for_task(task)
+        ):
+            hint = f"Retry {retry.get('count', 0)}: {retry.get('hint', '')}"
+        return "### Reviewer Output Error — Correct Your Review\n" + hint if hint else ""
+
     async def build_turn_mode_context(self, task: Task) -> str:
         """Render a compact ``## Turn Mode`` header so the agent knows
         both the scheduler's raw turn state and the action expected from it.
@@ -363,7 +388,10 @@ class ContextAssembler:
         turn-mode concept.
         """
         if str((task.metadata or {}).get("runtime_model", "") or "").strip() != "multi_team_org":
-            return ""
+            return (
+                "" if (task.metadata or {}).get("suppress_company_rework_feedback_context")
+                else await self.build_review_retry_context(task)
+            )
         turn_type = turn_type_for_task(task, fallback="")
         if turn_type == "self_evolution":
             retry_feedback = str(
@@ -486,6 +514,10 @@ class ContextAssembler:
         if raw_turn_mode:
             lines.append(f"- Runtime state: `{raw_turn_mode}`")
         lines.append(f"- Required action: {action}")
+        if mode == TurnMode.REVIEW and not (task.metadata or {}).get("suppress_company_rework_feedback_context"):
+            retry_context = await self.build_review_retry_context(task)
+            if retry_context:
+                lines.extend(["", retry_context])
         return "## Turn Mode\n" + "\n".join(lines)
 
     async def build_rework_feedback_context(

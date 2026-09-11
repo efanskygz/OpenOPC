@@ -62,6 +62,11 @@ from opc.core.models import (
     normalize_role_runtime_status,
 )
 from opc.core.worker_envelope import classify_worker_message, worker_message_is_actionable
+from opc.core.review_verdict import (
+    normalize_review_verdict,
+    parse_review_verdict,
+    review_feedback_error,
+)
 from opc.layer2_organization.company_runtime import CompanyRuntime, canonical_role_session_id
 from opc.layer2_organization.company_runtime_identity import (
     is_runtime_auxiliary_task,
@@ -363,6 +368,20 @@ DEFAULT_MAX_PRE_DELIVERY_REWORKS = 3
 # reviewer-side output failures (no extractable approve/reject label), not
 # honest-but-rejected work.
 MAX_VERDICT_PARSE_RETRIES = 2
+
+# A missing reject reason is a reviewer output error, with its own bounded
+# retries. It must never consume worker rework or auto-approve the child.
+MAX_REJECT_FEEDBACK_RETRIES = 2
+_REJECT_FEEDBACK_MISSING = "reject_feedback_missing"
+_REJECT_FEEDBACK_EXHAUSTED = "reject_feedback_retry_exhausted"
+_REJECT_FEEDBACK_RETRY_HINT = (
+    "\n\n[REVIEW OUTPUT ERROR — "
+    + review_feedback_error({"label": "reject"})
+    + '\nReturn {"review_verdict":"reject","summary":"<specific reason>",'
+    '"blocking_issues":["<specific correction>"],"followups":[]}. '
+    "Keep your decision grounded in the deliverable; do not switch to approve "
+    "just to avoid this validation error.]"
+)
 
 # Cap consecutive FAILED report cards for one parent while it stays in
 # AWAITING_MANAGER_REVIEW. Reconcile treats FAILED as "no active report" and
@@ -4703,8 +4722,12 @@ class CompanyWorkItemExecutor:
             ).strip()
             source_needs_review = source_report is not None and (
                 latest_linked_review is None
-                or linked_outcome == "verdict_parse_failed"
+                or linked_outcome in {"verdict_parse_failed", _REJECT_FEEDBACK_MISSING}
             )
+            if linked_outcome == _REJECT_FEEDBACK_EXHAUSTED:
+                # A terminal reviewer error is not a missing review. Starting
+                # another card here would reset the bounded retry indefinitely.
+                continue
             try:
                 if source_needs_review and source_report is not None:
                     source_metadata = dict(source_report.metadata or {})
@@ -4752,10 +4775,14 @@ class CompanyWorkItemExecutor:
                             metadata_updates=parent_updates,
                         )
                     retry_updates: dict[str, Any] = {}
-                    if linked_outcome == "verdict_parse_failed":
+                    if linked_outcome in {"verdict_parse_failed", _REJECT_FEEDBACK_MISSING}:
                         retry_updates = {
-                            "review_retry_hint": _REVIEW_VERDICT_PARSE_RETRY_HINT,
-                            "review_retry_reason": "verdict_parse_failed",
+                            "review_retry_hint": (
+                                _REJECT_FEEDBACK_RETRY_HINT
+                                if linked_outcome == _REJECT_FEEDBACK_MISSING
+                                else _REVIEW_VERDICT_PARSE_RETRY_HINT
+                            ),
+                            "review_retry_reason": linked_outcome,
                             "review_retry_of_attempt": self._auxiliary_attempt_number(
                                 latest_linked_review,
                                 kind="review",
@@ -4772,10 +4799,14 @@ class CompanyWorkItemExecutor:
                     )
                 elif opaque_completion_report:
                     retry_updates: dict[str, Any] = {}
-                    if linked_outcome == "verdict_parse_failed":
+                    if linked_outcome in {"verdict_parse_failed", _REJECT_FEEDBACK_MISSING}:
                         retry_updates = {
-                            "review_retry_hint": _REVIEW_VERDICT_PARSE_RETRY_HINT,
-                            "review_retry_reason": "verdict_parse_failed",
+                            "review_retry_hint": (
+                                _REJECT_FEEDBACK_RETRY_HINT
+                                if linked_outcome == _REJECT_FEEDBACK_MISSING
+                                else _REVIEW_VERDICT_PARSE_RETRY_HINT
+                            ),
+                            "review_retry_reason": linked_outcome,
                             "review_retry_of_attempt": self._auxiliary_attempt_number(
                                 latest_linked_review,
                                 kind="review",
@@ -6266,6 +6297,20 @@ class CompanyWorkItemExecutor:
                     if not active_tasks:
                         break
                     if not runnable and not claims:
+                        reviewer_errors = [
+                            item for item in work_items
+                            if (item.metadata or {}).get("review_work_item_outcome") == _REJECT_FEEDBACK_EXHAUSTED
+                            and item.phase == Phase.FAILED
+                            and (target := work_item_by_id.get(str((item.metadata or {}).get("review_target_work_item_id", "")))) is not None
+                            and target.phase == Phase.AWAITING_MANAGER_REVIEW
+                        ]
+                        if reviewer_errors:
+                            summary = "Company review failed: " + "; ".join(
+                                f"reviewer {item.role_id} ({item.work_item_id}) returned reject without actionable feedback after retries"
+                                for item in reviewer_errors
+                            ) + ". Worker deliverables remain awaiting review; no worker rework or approval was applied."
+                            await self._emit_progress(summary)
+                            return summary
                         human_waiting = [
                             t for t in active_tasks
                             if t.status in {TaskStatus.AWAITING_HUMAN, TaskStatus.AWAITING_MANAGER_REVIEW, TaskStatus.AWAITING_REVIEW}
@@ -7620,8 +7665,8 @@ class CompanyWorkItemExecutor:
                 # Review verdicts are applied mechanically by
                 # ``_finalize_review_work_item`` (runtime reads the
                 # structured verdict emitted by the review agent and
-                # updates the child work item directly).  No retry loop
-                # is needed: one review turn produces one verdict.
+                # updates the child work item directly). Invalid review
+                # output retries on a separate card for the same reviewer.
                 await self._append_progress(task, f"Team-runtime turn completed by role {task.assigned_to}.")
                 await self._apply_done_transition(task, result=result)
                 if self._is_authoritative_delivery_work_item(task) or self._requires_user_feedback(task):
@@ -7653,6 +7698,8 @@ class CompanyWorkItemExecutor:
             gate = self._gate_from_metadata(task.metadata.get("work_item_gate"))
             if gate and self._work_item_gate_enforcement_enabled(task):
                 await self._apply_gate(task, gate, task_by_projection_id)
+                if task.metadata.pop("_retry_contract_enforcement", False):
+                    continue
             else:
                 if gate:
                     await self._append_progress(task, f"Work-item gate `{gate.gate_type}` skipped by runtime policy.")
@@ -9785,9 +9832,11 @@ class CompanyWorkItemExecutor:
         outcome: str,
         resolution: dict[str, Any] | None = None,
         controller_task: Task | None = None,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> DelegationWorkItem | None:
         """Persist a terminal review card or release its claim for retry."""
         metadata_updates: dict[str, Any] = {
+            **dict(extra_metadata or {}),
             "claimed_by_role_session_id": "",
             "claimed_task_id": "",
             "review_work_item_outcome": outcome,
@@ -10273,8 +10322,10 @@ class CompanyWorkItemExecutor:
 
         The runtime is intentionally minimal here:
 
-        * If the verdict has a parseable ``approve`` / ``reject`` label,
-          apply it mechanically unless the approve is internally
+        * A reject must carry a reason or a blocking correction. Missing
+          feedback retries the reviewer; exhaustion fails that review and
+          leaves the worker awaiting review, without approval or worker rework.
+        * Otherwise apply the decision unless the approve is internally
           contradictory with explicit blocked/missing evidence. Reject
           cycles as machine-readable rework; non-final review never escalates
           to human review.
@@ -10283,8 +10334,8 @@ class CompanyWorkItemExecutor:
           ``MAX_VERDICT_PARSE_RETRIES``, close the review as done/approved
           with audit metadata instead of sending the worker back for rework.
 
-        The runtime does NOT inspect issue counts, summary length, or prose
-        quality, and does NOT silently flip reject to approve. It only blocks
+        Validation does not impose a minimum summary length or judge prose
+        quality, and never flips a missing-feedback reject to approve. It only blocks
         high-confidence contradictory approvals where evidence says blocked,
         failed, or missing.
 
@@ -10334,7 +10385,36 @@ class CompanyWorkItemExecutor:
             await self._notify_kanban_changed()
             return
         verdict = self._normalize_review_verdict(review_metadata.get("structured_review_verdict"))
+        # Reparse only THIS review's raw result to repair old label-only
+        # metadata. An existing decision stays authoritative if text conflicts.
+        if not verdict or review_feedback_error(verdict):
+            review_result = review_task.result
+            content = (
+                review_result.get("content", "")
+                if isinstance(review_result, dict)
+                else getattr(review_result, "content", "")
+            )
+            recovered = parse_review_verdict(
+                content or "", {"review_verdict": verdict} if verdict else None,
+            )
+            if recovered:
+                verdict = recovered
+        if (
+            review_metadata.get("review_work_item_outcome") == _REJECT_FEEDBACK_EXHAUSTED
+            and getattr(review_item, "phase", None) in DONE_PHASES
+        ):
+            return
+        feedback_error = review_feedback_error(verdict)
+        # A malformed response while correcting missing feedback remains a
+        # reviewer error; it must not fall into the legacy parse auto-done path.
+        if not verdict and review_metadata.get("review_retry_reason") == _REJECT_FEEDBACK_MISSING:
+            feedback_error = review_feedback_error({"label": "reject"})
+        if feedback_error:
+            await self._retry_missing_reject_feedback(review_task, review_item, child_item)
+            return
         verdict_label = str(verdict.get("label", "") or "").strip().lower() if verdict else ""
+        if verdict:
+            review_task.metadata["structured_review_verdict"] = verdict
         approval_blocker_reason = (
             self._review_approval_blocker_reason(review_metadata)
             if verdict_label == "approve"
@@ -10770,6 +10850,68 @@ class CompanyWorkItemExecutor:
                 return value
         return DEFAULT_MAX_REVIEW_REWORKS
 
+    async def _retry_missing_reject_feedback(
+        self, review_task: Task, review_item: Any, child_item: DelegationWorkItem,
+    ) -> None:
+        """Return a validation error to the same reviewer, never the worker."""
+        review_id = linked_work_item_id_for_task(review_task)
+        current_attempt = self._auxiliary_attempt_number(review_item, kind="review")
+        source_report = str((getattr(review_item, "metadata", {}) or {}).get("review_source_report_work_item_id", ""))
+        prior_retries = 0
+        prior_reviews = self._targeting_auxiliary_items(
+            await self._run_items_for_parent(child_item), child_item.work_item_id, kind="review",
+        )
+        for prior in reversed(prior_reviews):
+            if prior.work_item_id == review_id:
+                continue
+            if self._auxiliary_attempt_number(prior, kind="review") >= current_attempt:
+                continue
+            meta = dict(prior.metadata or {})
+            if str(meta.get("review_source_report_work_item_id", "")) != source_report:
+                break
+            if meta.get("review_work_item_outcome") != _REJECT_FEEDBACK_MISSING:
+                break
+            prior_retries += 1
+        error = review_feedback_error({"label": "reject"})
+        if prior_retries < MAX_REJECT_FEEDBACK_RETRIES:
+            spawned = await self._retry_verdict_parse_failed(
+                review_task=review_task,
+                review_work_item_id=review_id,
+                target_work_item_id=child_item.work_item_id,
+                new_retry_count=prior_retries + 1,
+                failure_reason=_REJECT_FEEDBACK_MISSING,
+                retry_hint=_REJECT_FEEDBACK_RETRY_HINT,
+            )
+            if spawned:
+                review_task.status = TaskStatus.CANCELLED
+            message = (
+                f"[Company:{self._projection_id_for_task(review_task)}] {error} "
+                + (f"Retrying reviewer {review_task.assigned_to} ({prior_retries + 1}/{MAX_REJECT_FEEDBACK_RETRIES})."
+                   if spawned else "Reviewer retry pending durable reconciliation.")
+            )
+        else:
+            persisted = await self._persist_terminal_review_card(
+                review_id, phase=Phase.FAILED, outcome=_REJECT_FEEDBACK_EXHAUSTED,
+                controller_task=review_task,
+                extra_metadata={
+                    "review_retry_reason": _REJECT_FEEDBACK_MISSING,
+                    "review_retry_hint": _REJECT_FEEDBACK_RETRY_HINT,
+                    "hidden_from_company_kanban": False,
+                },
+            )
+            if persisted is None:
+                await self._notify_kanban_changed()
+                return
+            review_task.status = TaskStatus.FAILED
+            message = (
+                f"[Company:{self._projection_id_for_task(review_task)}] {error} "
+                f"Reviewer {review_task.assigned_to} exhausted {MAX_REJECT_FEEDBACK_RETRIES} retries. "
+                "Review failed; the worker remains awaiting review and has not been approved or reworked."
+            )
+        logger.error(message)
+        await self._emit_progress(message, task_id=review_task.id)
+        await self._notify_kanban_changed()
+
     async def _retry_verdict_parse_failed(
         self,
         *,
@@ -10777,14 +10919,16 @@ class CompanyWorkItemExecutor:
         review_work_item_id: str,
         target_work_item_id: str,
         new_retry_count: int,
+        failure_reason: str = "verdict_parse_failed",
+        retry_hint: str = _REVIEW_VERDICT_PARSE_RETRY_HINT,
     ) -> bool:
-        """Spawn Review #N+1 because the previous reviewer turn produced a
-        verdict the runtime could not parse into approve/reject.
+        """Spawn Review #N+1 to correct the previous reviewer's output.
 
         Distinct from worker rework: this is a reviewer-side output
         recovery, NOT a re-evaluation of the deliverable. Counts against
-        ``review_verdict_parse_retry_count`` (independent budget from
-        ``review_rework_count``).
+        ``review_verdict_parse_retry_count`` for parse failures; missing
+        reject feedback uses its own review-card journal budget. Neither
+        counts against ``review_rework_count``.
         """
         if not self.store or not hasattr(self.store, "update_delegation_work_item"):
             return False
@@ -10857,8 +11001,9 @@ class CompanyWorkItemExecutor:
         persisted_prior = await self._persist_terminal_review_card(
             review_work_item_id,
             phase=Phase.CANCELLED,
-            outcome="verdict_parse_failed",
+            outcome=failure_reason,
             controller_task=review_task,
+            extra_metadata={"review_retry_reason": failure_reason, "review_retry_hint": retry_hint},
         )
         if persisted_prior is None:
             return False
@@ -10870,7 +11015,11 @@ class CompanyWorkItemExecutor:
                 "review_verdict_parse_retry_count": new_retry_count,
                 "review_verdict_parse_retry_at": datetime.now().isoformat(),
             }
-            if self._controller_attempt_context_for_task(review_task) is not None:
+            if failure_reason != "verdict_parse_failed":
+                # Missing-feedback retries are counted from review journals;
+                # leave the worker's existing counters completely unchanged.
+                pass
+            elif self._controller_attempt_context_for_task(review_task) is not None:
                 command_result = await self._execute_authoritative_command(
                     review_task,
                     operation="stamp_review_parse_retry",
@@ -10904,11 +11053,11 @@ class CompanyWorkItemExecutor:
             metadata_updates={
                 "review_owner_role_id": review_owner_role_id,
                 "review_owner_seat_id": review_owner_seat_id,
-                "review_retry_hint": _REVIEW_VERDICT_PARSE_RETRY_HINT,
+                "review_retry_hint": retry_hint,
                 "review_retry_of_attempt": int(
                     review_metadata.get("review_attempt", 0) or 0
                 ),
-                "review_retry_reason": "verdict_parse_failed",
+                "review_retry_reason": failure_reason,
             },
             source_report_item=source_report_item,
             controller_task=review_task,
@@ -10921,8 +11070,8 @@ class CompanyWorkItemExecutor:
                 "approve it or request rework."
             )
             new_review_updates = {
-                "review_retry_hint": _REVIEW_VERDICT_PARSE_RETRY_HINT,
-                "review_retry_reason": "verdict_parse_failed",
+                "review_retry_hint": retry_hint,
+                "review_retry_reason": failure_reason,
                 "review_retry_of_attempt": int(
                     review_metadata.get("review_attempt", 0) or 0
                 ),
@@ -10937,7 +11086,7 @@ class CompanyWorkItemExecutor:
                                 new_review_item, "work_item_id", ""
                             ),
                             summary=(
-                                base_summary + _REVIEW_VERDICT_PARSE_RETRY_HINT
+                                base_summary + retry_hint
                             ),
                             metadata_updates=new_review_updates,
                         ),
@@ -10948,7 +11097,7 @@ class CompanyWorkItemExecutor:
             else:
                 await self.store.update_delegation_work_item(
                     getattr(new_review_item, "work_item_id", ""),
-                    summary=base_summary + _REVIEW_VERDICT_PARSE_RETRY_HINT,
+                    summary=base_summary + retry_hint,
                     metadata_updates=new_review_updates,
                 )
         except Exception:
@@ -13836,6 +13985,49 @@ class CompanyWorkItemExecutor:
             await self._apply_automated_verification_gate(task, gate)
             return
 
+        if gate.gate_type == "review" and not gate.requires_human:
+            output = self._work_item_output_metadata_for_task(task)
+            raw_result = task.result if isinstance(task.result, dict) else {}
+            verdict = parse_review_verdict(
+                str(raw_result.get("content", "") or ""),
+                {"review_verdict": output.get("structured_review_verdict") or task.metadata.get("structured_review_verdict")},
+            )
+            prior = (task.context_snapshot or {}).get("review_output_retry", {})
+            matching_retry = (
+                isinstance(prior, dict) and prior.get("task_id") == task.id
+                and prior.get("role_id") == task.assigned_to
+                and prior.get("work_item_id", "") == linked_work_item_id_for_task(task)
+            )
+            error = review_feedback_error(verdict)
+            if matching_retry and not verdict:
+                error = review_feedback_error({"label": "reject"})
+            if error:
+                count = self._safe_positive_int(prior.get("count")) if matching_retry else 0
+                if count < MAX_REJECT_FEEDBACK_RETRIES:
+                    task.context_snapshot = {
+                        **dict(task.context_snapshot or {}),
+                        "review_output_retry": {
+                            "task_id": task.id, "role_id": task.assigned_to,
+                            "work_item_id": linked_work_item_id_for_task(task),
+                            "count": count + 1, "hint": _REJECT_FEEDBACK_RETRY_HINT,
+                        },
+                    }
+                    task.metadata["_retry_contract_enforcement"] = True
+                else:
+                    await transition_work_item_from_task(
+                        self.store, task, target_status_or_phase=Phase.FAILED,
+                        reason=_REJECT_FEEDBACK_EXHAUSTED,
+                    )
+                await self._append_progress(task, error)
+                await self.save_task(task)
+                await self._emit_progress(
+                    f"[Company:{self._projection_id_for_task(task)}] {error} "
+                    + ("Retrying this reviewer." if count < MAX_REJECT_FEEDBACK_RETRIES else "Reviewer retries exhausted; review failed."),
+                    task_id=task.id,
+                )
+                return
+            task.context_snapshot.pop("review_output_retry", None)
+
         metadata = {
             "role_id": task.assigned_to,
             "gate_type": gate.gate_type,
@@ -16093,8 +16285,6 @@ class CompanyWorkItemExecutor:
             "work_item_runtime_plan",
             "artifact_index",
             "work_item_artifact_index",
-            "review_verdict",
-            "structured_review_verdict",
             "delivery_package",
             "final_delivery_package",
             "follow_up_actions",
@@ -16116,25 +16306,22 @@ class CompanyWorkItemExecutor:
                     "work_item_runtime_plan",
                     "artifact_index",
                     "work_item_artifact_index",
-                    "review_verdict",
-                    "structured_review_verdict",
                     "delivery_package",
                     "final_delivery_package",
                     "follow_up_actions",
                 ):
                     if key in data and key not in payload:
                         payload[key] = data[key]
-                if "review_verdict" not in payload and any(key in data for key in ("verdict", "decision", "status")):
-                    payload["review_verdict"] = data
             start = search.find("{", start + consumed)
         if "runtime_plan" not in payload and "work_item_runtime_plan" in payload:
             payload["runtime_plan"] = payload["work_item_runtime_plan"]
         if "artifact_index" not in payload and "work_item_artifact_index" in payload:
             payload["artifact_index"] = payload["work_item_artifact_index"]
-        if "review_verdict" not in payload and "structured_review_verdict" in payload:
-            payload["review_verdict"] = payload["structured_review_verdict"]
         if "delivery_package" not in payload and "final_delivery_package" in payload:
             payload["delivery_package"] = payload["final_delivery_package"]
+        verdict = parse_review_verdict(content, artifacts)
+        if verdict:
+            payload["review_verdict"] = verdict
         return payload
 
     def _normalize_delivery_package(self, value: Any) -> dict[str, Any]:
@@ -16298,48 +16485,7 @@ class CompanyWorkItemExecutor:
         return None
 
     def _normalize_review_verdict(self, value: Any) -> dict[str, Any]:
-        if isinstance(value, str):
-            lowered = value.strip().lower()
-            if lowered in {"approve", "approved", "pass", "passed", "accept", "accepted"}:
-                return {"label": "approve", "summary": value.strip()}
-            if lowered in {"reject", "rejected", "fail", "failed", "rework"}:
-                return {"label": "reject", "summary": value.strip()}
-            return {}
-        if not isinstance(value, dict):
-            return {}
-        # Accept both the raw agent JSON shape (review_verdict|verdict|
-        # decision|status) AND the already-normalized shape (label) emitted
-        # by the external broker's adapter.infer_review_verdict.
-        raw = str(
-            value.get("review_verdict")
-            or value.get("verdict")
-            or value.get("decision")
-            or value.get("status")
-            or value.get("label")
-            or ""
-        ).strip().lower()
-        if raw in {"approved", "pass", "passed", "accept", "accepted"}:
-            raw = "approve"
-        elif raw in {"rejected", "fail", "failed", "rework"}:
-            raw = "reject"
-        if raw not in {"approve", "reject"}:
-            return {}
-        blocking = value.get("blocking_issues", [])
-        followups = value.get("followups", [])
-        return {
-            "label": raw,
-            "summary": str(value.get("summary", "") or "").strip(),
-            "blocking_issues": [
-                str(item).strip()
-                for item in (blocking if isinstance(blocking, list) else [])
-                if str(item).strip()
-            ][:8],
-            "followups": [
-                str(item).strip()
-                for item in (followups if isinstance(followups, list) else [])
-                if str(item).strip()
-            ][:8],
-        }
+        return normalize_review_verdict(value)
 
     def _structured_or_inferred_verdict(self, task: Task, gate: WorkItemGatePolicy) -> str:
         output_metadata = self._work_item_output_metadata_for_task(task)
@@ -16377,6 +16523,12 @@ class CompanyWorkItemExecutor:
             output_metadata.get("structured_review_verdict")
             or task.metadata.get("structured_review_verdict")
         )
+        if structured and review_feedback_error(structured):
+            result = task.result
+            content = result.get("content", "") if isinstance(result, dict) else getattr(result, "content", "")
+            structured = parse_review_verdict(content or "", {"review_verdict": structured})
+            if review_feedback_error(structured):
+                return ""
         if not structured:
             return ""
         lines: list[str] = []

@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from opc.core.config import ExternalAgentConfig
+from opc.core.review_verdict import parse_review_verdict
 
 from opc.core.models import AgentStatus, Task, TaskResult
 
@@ -390,90 +391,18 @@ class ExternalAgentAdapter(abc.ABC):
             ):
                 if key in candidate and key not in payload:
                     payload[key] = candidate[key]
-            # Fix 4: a flat JSON envelope of the canonical shape
-            #   {"review_verdict":"reject","summary":"...","blocking_issues":[...],"followups":[...]}
-            # used to degenerate into ``payload["review_verdict"] = "reject"``
-            # (the inner string) because the old extractor pulled
-            # ``candidate[key]`` instead of ``candidate`` when the key was
-            # already present in the top-level dict. That silently dropped
-            # the reviewer's actual blocking_issues/followups. Now we
-            # preserve the whole candidate whenever review_verdict carries
-            # a verdict label (string OR dict) AND there are sibling fields
-            # that make the candidate a structured envelope.
-            if "review_verdict" in candidate and "review_verdict" not in payload:
-                inner = candidate["review_verdict"]
-                has_sibling_fields = any(
-                    key in candidate
-                    for key in ("summary", "blocking_issues", "followups")
-                )
-                if isinstance(inner, dict):
-                    payload["review_verdict"] = inner
-                elif has_sibling_fields:
-                    # Preserve the full envelope so downstream gets
-                    # ``{review_verdict, summary, blocking_issues, followups}``.
-                    payload["review_verdict"] = candidate
-                else:
-                    payload["review_verdict"] = inner
-            if "review_verdict" not in payload and any(
-                key in candidate for key in ("verdict", "decision", "status")
-            ):
-                payload["review_verdict"] = candidate
+        verdict = parse_review_verdict(output)
+        if verdict:
+            payload["review_verdict"] = verdict
         return payload
 
     def infer_review_verdict(self, output: str) -> dict[str, Any]:
-        """Extract an ``approve``/``reject`` verdict from a reviewer's output.
+        """Parse the reviewer decision without changing its meaning.
 
-        The runtime treats the reviewer agent as the authoritative judge
-        and does NOT second-guess verdict shape or content. This helper
-        is purely a JSON parser: when the reviewer emits a structured
-        verdict (per the prompt's suggested schema), we extract its
-        label and pass-through fields. When no parseable verdict is
-        present, we return ``{}`` and let the runtime spawn a verdict-
-        parse-retry attempt.
-
-        Returns a dict with at least ``label`` ∈ {"approve", "reject"}
-        on success, or ``{}`` if no parseable verdict was found.
+        The Company runtime validates reject feedback and retries the same
+        reviewer if it cannot give the worker an actionable reason.
         """
-        structured = self.extract_structured_result_fields(output)
-        explicit = structured.get("review_verdict") or structured.get("structured_review_verdict")
-        if isinstance(explicit, str):
-            normalized = explicit.strip().lower()
-            if normalized in {"approve", "approved", "pass", "passed", "accept", "accepted"}:
-                return {"label": "approve", "summary": explicit.strip()}
-            if normalized in {"reject", "rejected", "fail", "failed", "rework"}:
-                return {"label": "reject", "summary": explicit.strip()}
-            return {}
-        if isinstance(explicit, dict):
-            raw = str(
-                explicit.get("review_verdict")
-                or explicit.get("verdict")
-                or explicit.get("decision")
-                or explicit.get("status")
-                or explicit.get("label")
-                or ""
-            ).strip().lower()
-            if raw in {"approved", "pass", "passed", "accept", "accepted"}:
-                raw = "approve"
-            elif raw in {"rejected", "fail", "failed", "rework"}:
-                raw = "reject"
-            if raw in {"approve", "reject"}:
-                blocking = explicit.get("blocking_issues", [])
-                followups = explicit.get("followups", [])
-                return {
-                    "label": raw,
-                    "summary": str(explicit.get("summary", "") or "").strip(),
-                    "blocking_issues": [
-                        str(item).strip()
-                        for item in (blocking if isinstance(blocking, list) else [])
-                        if str(item).strip()
-                    ][:8],
-                    "followups": [
-                        str(item).strip()
-                        for item in (followups if isinstance(followups, list) else [])
-                        if str(item).strip()
-                    ][:8],
-                }
-        return {}
+        return parse_review_verdict(output)
 
     def format_progress_update(self, text: str, stream_name: str) -> str | None:
         """Convert a raw stream line into a user-facing progress update."""
