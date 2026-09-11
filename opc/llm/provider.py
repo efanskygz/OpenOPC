@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
@@ -243,6 +244,9 @@ class LLMProvider:
         self._total_tokens_in = 0
         self._total_tokens_out = 0
         self._total_cost = 0.0
+        # Instance-local and endpoint/model scoped: proxy caps must never leak
+        # to another company's provider or to a differently routed model.
+        self._output_caps: dict[tuple[str, ...], int] = {}
 
         self._api_key = config.api_key or (
             os.environ.get(config.api_key_env) if config.api_key_env else None
@@ -549,6 +553,64 @@ class LLMProvider:
         content_parts.extend(parts)
         return content_parts
 
+    @staticmethod
+    def _usage_payload(usage: Any) -> dict[str, Any]:
+        if usage is None:
+            return {}
+        if hasattr(usage, "model_dump"):
+            raw = usage.model_dump(exclude_none=True)
+        elif isinstance(usage, dict):
+            raw = dict(usage)
+        else:
+            raw = vars(usage).copy() if hasattr(usage, "__dict__") else {}
+        # Some SDKs expose nested detail objects instead of plain dictionaries.
+        raw = json.loads(json.dumps(raw, default=lambda value: vars(value) if hasattr(value, "__dict__") else str(value)))
+        payload = {"usage_raw": raw, "usage_source": "provider"}
+        for key in ("prompt_tokens", "completion_tokens"):
+            payload[key] = int(raw.get(key, 0) or 0)
+        prompt_details = raw.get("prompt_tokens_details") or {}
+        completion_details = raw.get("completion_tokens_details") or {}
+        cached = prompt_details.get("cached_tokens", raw.get("prompt_cache_hit_tokens")) if isinstance(prompt_details, dict) else None
+        reasoning = completion_details.get("reasoning_tokens") if isinstance(completion_details, dict) else None
+        if cached is not None:
+            payload["cached_input_tokens"] = int(cached)
+        if reasoning is not None:
+            payload["reasoning_tokens"] = int(reasoning)
+        return payload
+
+    async def _completion_with_compatible_limits(self, call_kwargs: dict[str, Any], *, auto_usage: bool = False) -> Any:
+        request = dict(call_kwargs)
+        key = tuple(str(request.get(field, "") or "") for field in (
+            "model", "api_base", "custom_llm_provider", "deployment_id", "api_version",
+        ))
+        if key in self._output_caps:
+            request["max_tokens"] = min(int(request["max_tokens"]), self._output_caps[key])
+        cap_retried = False
+        while True:
+            try:
+                return await litellm.acompletion(**request)
+            except Exception as exc:
+                error = str(exc)
+                # Retry only a precise output-parameter validation failure,
+                # before any streamed content or tool action is delivered.
+                match = re.search(
+                    r"max_(?:completion_)?tokens[^\n]{0,200}?(?:<=|less than or equal to|at most)\s*(\d+)",
+                    error, re.IGNORECASE,
+                )
+                cap = int(match.group(1)) if match else 0
+                if not cap_retried and 0 < cap < int(request.get("max_tokens", 0) or 0):
+                    cap_retried = True
+                    self._output_caps[key] = min(cap, self._output_caps.get(key, cap))
+                    request["max_tokens"] = self._output_caps[key]
+                    continue
+                if auto_usage and "stream_options" in error.lower() and re.search(
+                    r"unsupported|not supported|unrecognized|unknown|unexpected", error, re.IGNORECASE,
+                ):
+                    auto_usage = False
+                    request.pop("stream_options", None)
+                    continue
+                raise
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -582,16 +644,17 @@ class LLMProvider:
         logger.debug(f"LLM call: model={model}, base={self._api_base or 'default'}, msgs={len(messages)}, tools={len(tools or [])}")
 
         try:
-            response = await litellm.acompletion(**call_kwargs)
+            response = await self._completion_with_compatible_limits(call_kwargs)
         except Exception as e:
             logger.error(f"LLM call failed: {e}")
             raise
 
         usage = getattr(response, "usage", None)
+        usage_payload = {"prompt_tokens": 0, "completion_tokens": 0, **self._usage_payload(usage)}
         cost = 0.0
         if usage:
-            self._total_tokens_in += getattr(usage, "prompt_tokens", 0)
-            self._total_tokens_out += getattr(usage, "completion_tokens", 0)
+            self._total_tokens_in += usage_payload["prompt_tokens"]
+            self._total_tokens_out += usage_payload["completion_tokens"]
             try:
                 cost = litellm.completion_cost(completion_response=response)
                 self._total_cost += cost
@@ -607,10 +670,7 @@ class LLMProvider:
             "finish_reason": choice.finish_reason,
             "model": model,
             "cost": cost,
-            "usage": {
-                "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
-                "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
-            },
+            "usage": usage_payload,
         }
 
         if message.tool_calls:
@@ -642,8 +702,7 @@ class LLMProvider:
                 event_type="usage",
                 model=model,
                 payload={
-                    "prompt_tokens": getattr(usage, "prompt_tokens", 0),
-                    "completion_tokens": getattr(usage, "completion_tokens", 0),
+                    **self._usage_payload(usage),
                     "context_window": self.get_context_window(model=model),
                 },
             ))
@@ -732,10 +791,13 @@ class LLMProvider:
         )
 
         last_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        auto_usage = "stream_options" not in call_kwargs
+        if auto_usage:
+            call_kwargs["stream_options"] = {"include_usage": True}
         yield RuntimeLLMEvent(event_type="message_start", model=model, payload={"model": model})
 
         try:
-            stream = await litellm.acompletion(**call_kwargs)
+            stream = await self._completion_with_compatible_limits(call_kwargs, auto_usage=auto_usage)
             if hasattr(stream, "__aiter__"):
                 async for chunk in stream:
                     for event in self.normalize_stream_event(chunk, model=model):
@@ -744,8 +806,8 @@ class LLMProvider:
                             total_completion = int(event.payload.get("completion_tokens", 0) or 0)
                             delta_prompt = max(0, total_prompt - last_usage["prompt_tokens"])
                             delta_completion = max(0, total_completion - last_usage["completion_tokens"])
-                            last_usage["prompt_tokens"] = total_prompt
-                            last_usage["completion_tokens"] = total_completion
+                            last_usage["prompt_tokens"] = max(last_usage["prompt_tokens"], total_prompt)
+                            last_usage["completion_tokens"] = max(last_usage["completion_tokens"], total_completion)
                             cost = 0.0
                             try:
                                 prompt_cost, completion_cost = litellm.cost_per_token(
@@ -781,12 +843,12 @@ class LLMProvider:
                         model=model,
                         payload={"text": message.content},
                     )
-                for tc in getattr(message, "tool_calls", None) or []:
+                for index, tc in enumerate(getattr(message, "tool_calls", None) or []):
                     yield RuntimeLLMEvent(
                         event_type="tool_call_delta",
                         model=model,
                         payload={
-                            "index": 0,
+                            "index": index,
                             "id": getattr(tc, "id", ""),
                             "name": getattr(getattr(tc, "function", None), "name", ""),
                             "arguments": getattr(getattr(tc, "function", None), "arguments", ""),
@@ -795,8 +857,9 @@ class LLMProvider:
                 usage = getattr(stream, "usage", None)
                 if usage:
                     cost = 0.0
-                    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
-                    completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+                    usage_payload = self._usage_payload(usage)
+                    prompt_tokens = int(usage_payload.get("prompt_tokens", 0))
+                    completion_tokens = int(usage_payload.get("completion_tokens", 0))
                     try:
                         prompt_cost, completion_cost = litellm.cost_per_token(
                             model=model,
@@ -813,6 +876,7 @@ class LLMProvider:
                         event_type="usage",
                         model=model,
                         payload={
+                            **usage_payload,
                             "prompt_tokens": prompt_tokens,
                             "completion_tokens": completion_tokens,
                             "prompt_tokens_total": prompt_tokens,

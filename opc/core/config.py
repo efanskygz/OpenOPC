@@ -704,6 +704,8 @@ class NativeRuntimeConfig(BaseModel):
     stream_llm: bool = True
     emit_runtime_events: bool = True
     event_protocol_version: str = "v2"
+    delta_coalesce_ms: int = Field(default=80, ge=0, le=1000)
+    delta_coalesce_chars: int = Field(default=512, ge=1)
     enable_tool_hooks: bool = True
     converge_on_parallel_failure: bool = True
     max_parallel_read_tools: int = 6

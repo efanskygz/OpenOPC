@@ -8,6 +8,7 @@ import json
 import re
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Awaitable, Callable
@@ -16,6 +17,7 @@ from loguru import logger
 
 from opc.core.company_controller import CompanyRunControllerLeaseLost
 from opc.core.config import OPCConfig
+from opc.core.session_parts import normalized_session_parts
 from opc.core.events import EventBus
 from opc.core.models import OPCEvent, PermissionResolution, Task, TaskResult, TaskStatus, VerificationEvidence
 from opc.layer0_interaction.coordinator import InteractionCoordinator
@@ -29,6 +31,7 @@ from opc.layer2_organization.work_item_identity import (
 from opc.layer2_organization.work_item_links import linked_work_item_id_for_task
 from opc.layer3_agent.runtime_v2.permissions import RuntimePermissionAdapter
 from opc.layer3_agent.runtime_v2.streaming_tool_executor import StreamingToolExecutor
+from opc.layer3_agent.runtime_v2.stream_events import RuntimeDeltaBuffer
 from opc.layer3_agent.runtime_v2.subagents import ChildAgentFactory, SubagentManager
 from opc.layer3_agent.runtime_v2.tool_hooks import (
     RuntimeCompanyControllerToolFence,
@@ -40,7 +43,7 @@ from opc.layer3_agent.prompt_harness import (
     render_runtime_artifact_messages,
     strip_runtime_artifact_messages,
 )
-from opc.layer3_agent.prompt_harness.artifacts import build_runtime_artifact_record
+from opc.layer3_agent.prompt_harness.artifacts import build_runtime_artifact_record, is_runtime_artifact_message
 from opc.layer3_agent.prompt_harness.types import RuntimeArtifact
 from opc.layer4_tools.execution_context import ensure_task_execution_context
 from opc.layer4_tools.opaque_execution import (
@@ -107,6 +110,7 @@ class NativeRuntimeV2:
         self.interaction_coordinator = interaction_coordinator or getattr(
             permission_policy, "interaction_coordinator", None
         )
+        self._delta_buffer: ContextVar[RuntimeDeltaBuffer | None] = ContextVar("native_delta_buffer", default=None)
         self._pre_tool_hooks: list[tuple[str, Any]] = []
         self._post_tool_hooks: list[tuple[str, Any]] = []
         self._failure_tool_hooks: list[tuple[str, Any]] = []
@@ -133,6 +137,13 @@ class NativeRuntimeV2:
     ) -> TaskResult:
         """Run one native turn with a durable permission failure boundary."""
 
+        buffer = RuntimeDeltaBuffer(
+            self._write_runtime_event,
+            delay_ms=self.config.system.native_runtime.delta_coalesce_ms,
+            max_chars=self.config.system.native_runtime.delta_coalesce_chars,
+        )
+        token = self._delta_buffer.set(buffer)
+        primary_error = False
         try:
             return await self._run_impl(
                 system_prompt,
@@ -145,6 +156,7 @@ class NativeRuntimeV2:
                 inbox_interrupt_provider=inbox_interrupt_provider,
             )
         except BaseException as exc:
+            primary_error = True
             if task is not None:
                 cleanup = asyncio.create_task(
                     self._settle_aborted_runtime(
@@ -163,6 +175,27 @@ class NativeRuntimeV2:
                         continue
                 await cleanup
             raise
+        finally:
+            # The buffer belongs to this invocation, including child tasks.
+            # Join final writes before an Engine shutdown can close the Store.
+            close = asyncio.create_task(buffer.close())
+            close_cancel: asyncio.CancelledError | None = None
+            try:
+                while not close.done():
+                    try:
+                        await asyncio.shield(close)
+                    except asyncio.CancelledError as exc:
+                        close_cancel = exc
+                        continue
+                await close
+            except Exception:
+                if not primary_error:
+                    raise
+                logger.exception("Could not flush native streaming events during abort")
+            finally:
+                self._delta_buffer.reset(token)
+            if close_cancel is not None and not primary_error:
+                raise close_cancel
 
     async def _run_impl(
         self,
@@ -388,9 +421,46 @@ class NativeRuntimeV2:
         # conversation so the model can adapt; the counter resets after every
         # successful stream so long runs are not penalized for sporadic blips.
         stream_error_feedback_retries = 0
+        incomplete_reply_retries = 0
+        incomplete_feedback: dict[str, Any] | None = None
         max_stream_error_feedback_retries = 2
         stream_error_context_reset_attempted = False
         compaction_boundaries: list[dict[str, Any]] = []
+
+        async def fail_run(
+            reason: str, content: str, *, iteration_number: int = 0, error: str = "",
+        ) -> TaskResult:
+            active_subagents = subagents.list_agents().get("agents", [])
+            artifacts = {
+                **aggregated_artifacts,
+                **self._build_runtime_state_metadata(
+                    task=task, messages=messages, todo_state=todo_state,
+                    runtime_notes=runtime_notes, compaction_boundaries=compaction_boundaries,
+                    active_subagents=active_subagents,
+                ),
+                "runtime_session_id": runtime_session_id,
+                **result_delivery_identity_payload_for_task(task, canonical_turn_id=conversation_turn_id),
+                "reason": reason,
+                **({"error": error} if error else {}),
+                "resume_cursor": len(messages),
+                "permission_requests": self._permission_requests_from_results([]),
+                "active_subagents": active_subagents,
+                "compaction_boundaries": list(compaction_boundaries),
+                "worktree_path": self._primary_worktree_path(active_subagents),
+            }
+            await self._emit_runtime_event(runtime_session_id, task, "turn_failed", {
+                "turn_id": conversation_turn_id, "canonical_turn_id": conversation_turn_id,
+                "conversation_turn_id": conversation_turn_id, "message": error or content, "reason": reason,
+                **({"iteration": iteration_number, "execution_turn_id": self._runtime_iteration_turn_id(
+                    conversation_turn_id, iteration_number - 1,
+                )} if iteration_number else {}),
+            })
+            runtime_status.update(current_tool=None, queue_depth=0, drain_mode="idle")
+            await self._emit_status_snapshot(runtime_session_id, task, runtime_status)
+            await self._save_runtime_session(runtime_session_id, task, "failed", artifacts)
+            self._cancel_prefetch(pending_prefetch)
+            return TaskResult(status=TaskStatus.FAILED, content=content, artifacts=artifacts,
+                              cost=total_cost, token_usage=total_usage)
 
         await self._save_runtime_session(
             runtime_session_id,
@@ -643,6 +713,8 @@ class NativeRuntimeV2:
             await self._emit_status_snapshot(runtime_session_id, task, runtime_status)
 
             assistant_text = ""
+            runtime_notes["latest_thinking_text"] = ""
+            turn_finish_reason = ""
             assistant_delta_seq = 0
             thinking_delta_seq = 0
             tool_call_chunks: dict[int, dict[str, Any]] = {}
@@ -674,9 +746,8 @@ class NativeRuntimeV2:
                     elif event.event_type == "thinking_delta":
                         thinking_text = str(event.payload.get("text", "") or "")
                         if thinking_text:
-                            # Keep the full thinking stream for the final
-                            # transcript metadata; the UI renders it as a
-                            # collapsed block after the turn completes.
+                            # Persist only this iteration; UI stream IDs also
+                            # distinguish iterations within a conversation turn.
                             runtime_notes["latest_thinking_text"] = (
                                 str(runtime_notes.get("latest_thinking_text", "") or "") + thinking_text
                             )
@@ -729,12 +800,15 @@ class NativeRuntimeV2:
                             on_progress=on_progress,
                             runtime_session_id=runtime_session_id,
                         )
+                    elif event.event_type == "message_stop":
+                        turn_finish_reason = str(event.payload.get("finish_reason", "") or "")
                     elif event.event_type == "usage":
                         prompt_tokens = int(event.payload.get("prompt_tokens", 0) or 0)
                         completion_tokens = int(event.payload.get("completion_tokens", 0) or 0)
                         estimated_cost_delta = float(event.payload.get("estimated_cost_delta", 0.0) or 0.0)
-                        if prompt_tokens:
-                            last_observed_prompt_tokens = prompt_tokens
+                        observed_prompt_tokens = int(event.payload.get("prompt_tokens_total", prompt_tokens) or 0)
+                        if observed_prompt_tokens:
+                            last_observed_prompt_tokens = observed_prompt_tokens
                         total_usage["prompt_tokens"] += prompt_tokens
                         total_usage["completion_tokens"] += completion_tokens
                         total_cost += estimated_cost_delta
@@ -775,6 +849,9 @@ class NativeRuntimeV2:
                                 "turn_cost_usd": runtime_status["turn_cost_usd"],
                                 "session_cost_usd": runtime_status["session_cost_usd"],
                                 "estimated_cost_delta": estimated_cost_delta,
+                                **{key: event.payload[key] for key in (
+                                    "usage_raw", "usage_source", "cached_input_tokens", "reasoning_tokens",
+                                ) if key in event.payload},
                             },
                         )
                         await self._emit_status_snapshot(runtime_session_id, task, runtime_status)
@@ -810,6 +887,7 @@ class NativeRuntimeV2:
                     raise quota_error from exc
                 if self.llm.is_context_overflow_error(exc) and overflow_retries < max_overflow_retries:
                     overflow_retries += 1
+                    await self._cancel_early_tool_runs(early_tool_runs)
                     messages = await self._apply_context_pipeline(
                         messages,
                         tool_schemas=tool_schemas,
@@ -903,35 +981,37 @@ class NativeRuntimeV2:
                             )
                             messages = truncated
                             continue
-                    await self._emit_runtime_event(
-                        runtime_session_id,
-                        task,
-                        "turn_failed",
-                        {
-                            "iteration": iteration + 1,
-                            "turn_id": conversation_turn_id,
-                            "canonical_turn_id": conversation_turn_id,
-                            "conversation_turn_id": conversation_turn_id,
-                            "execution_turn_id": self._runtime_iteration_turn_id(conversation_turn_id, iteration),
-                            "message": str(exc),
-                        },
-                    )
-                    runtime_status["current_tool"] = None
-                    runtime_status["queue_depth"] = 0
-                    runtime_status["drain_mode"] = "idle"
-                    await self._emit_status_snapshot(runtime_session_id, task, runtime_status)
-                    await self._save_runtime_session(runtime_session_id, task, "failed", {"error": str(exc)})
-                    self._cancel_prefetch(pending_prefetch)
-                    return TaskResult(
-                        status=TaskStatus.FAILED,
-                        content=f"LLM stream failed: {exc}",
-                        artifacts={"runtime_session_id": runtime_session_id},
-                        cost=total_cost,
-                        token_usage=total_usage,
-                    )
+                    return await fail_run("llm_stream_error", f"LLM stream failed: {exc}",
+                                          iteration_number=iteration + 1, error=str(exc))
 
             stream_error_feedback_retries = 0
             tool_calls = self._finalize_tool_calls(tool_call_chunks)
+            if not tool_calls and (not assistant_text.strip() or turn_finish_reason in {"length", "max_tokens"}):
+                await self._cancel_early_tool_runs(early_tool_runs)
+                truncated = turn_finish_reason in {"length", "max_tokens"}
+                if incomplete_reply_retries >= 2:
+                    return await fail_run(
+                        "incomplete_reply",
+                        "LLM returned an incomplete response (output token limit)" if assistant_text.strip()
+                        else "LLM returned no tool calls and no answer text after bounded retries",
+                        iteration_number=iteration + 1,
+                    )
+                incomplete_reply_retries += 1
+                # Replace feedback instead of accumulating empty assistant turns.
+                if incomplete_feedback is not None:
+                    messages = [item for item in messages if item != incomplete_feedback]
+                incomplete_feedback = {"role": "user", "content": (
+                    "[Runtime feedback] Your response reached the output token limit. "
+                    if truncated else "[Runtime feedback] Your response was empty. "
+                ) + "Continue the task with a tool call or provide a complete, concise answer. "
+                    "Do not treat this feedback as a new task."}
+                messages.append(incomplete_feedback)
+                await self._emit_runtime_event(runtime_session_id, task, "incomplete_reply_retry", {
+                    "iteration": iteration + 1, "attempt": incomplete_reply_retries,
+                    "finish_reason": turn_finish_reason, "partial_text": assistant_text,
+                })
+                continue
+            incomplete_reply_retries = 0
             assistant_message = {"role": "assistant", "content": assistant_text}
             if tool_calls:
                 assistant_message["tool_calls"] = [
@@ -1129,15 +1209,8 @@ class NativeRuntimeV2:
                         runtime_session_id=runtime_session_id,
                     )
 
-        await self._save_runtime_session(runtime_session_id, task, "failed", {"reason": "max_iterations"})
-        self._cancel_prefetch(pending_prefetch)
-        return TaskResult(
-            status=TaskStatus.FAILED,
-            content=f"Exceeded maximum iterations ({self.max_iterations})",
-            artifacts={"runtime_session_id": runtime_session_id},
-            cost=total_cost,
-            token_usage=total_usage,
-        )
+        return await fail_run("max_iterations", f"Exceeded maximum iterations ({self.max_iterations})",
+                              iteration_number=self.max_iterations)
 
     def _controller_tool_fence_store(self) -> Any:
         """Resolve the canonical Store without coupling the executor to memory."""
@@ -1934,6 +2007,10 @@ class NativeRuntimeV2:
         task: Task | None,
         suppress_resume_user_append: bool = False,
     ) -> tuple[list[dict[str, Any]], int]:
+        dynamic_context: list[dict[str, Any]] = []
+        if self._separate_dynamic_context():
+            dynamic_context = [item for item in context_messages or [] if self._is_managed_dynamic_message(item)]
+            context_messages = [item for item in context_messages or [] if not self._is_managed_dynamic_message(item)]
         runtime_resume = self._runtime_resume_payload(task)
         ready_permit = self._approved_resume_tool_call(task, state="ready")
         if ready_permit and (
@@ -1979,12 +2056,12 @@ class NativeRuntimeV2:
                     and self._should_append_resume_user_turn(restored, user_message)
                 ):
                     messages.append({"role": "user", "content": user_content})
-                return messages, len(prefix_messages)
+                return self._append_dynamic_context(messages, dynamic_context), len(prefix_messages)
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         if context_messages:
             messages.extend(context_messages)
         messages.append({"role": "user", "content": user_content})
-        return messages, len(messages)
+        return self._append_dynamic_context(messages, dynamic_context), len(messages)
 
     def _sanitize_restored_history_for_resume(
         self,
@@ -2137,13 +2214,12 @@ class NativeRuntimeV2:
                 assistant_texts: list[str] = []
                 tool_calls: list[dict[str, Any]] = []
                 tool_results: list[dict[str, Any]] = []
-                for part_index, part in enumerate(parts):
-                    payload = dict(part.payload or {})
-                    if part.part_type == "text":
+                for part_index, (part_type, payload) in enumerate(normalized_session_parts(parts)):
+                    if part_type == "text":
                         text = str(payload.get("text", "") or "").strip()
                         if text:
                             assistant_texts.append(text)
-                    elif part.part_type == "tool_call":
+                    elif part_type == "tool_call":
                         tool_name = str(payload.get("tool_name", "") or "").strip()
                         tool_call_id = str(payload.get("tool_call_id", "") or "").strip()
                         if not tool_call_id:
@@ -2166,7 +2242,7 @@ class NativeRuntimeV2:
                             "tool_name": tool_name,
                             "consumed": False,
                         })
-                    elif part.part_type in {"tool_output", "tool_result"}:
+                    elif part_type in {"tool_output", "tool_result"}:
                         tool_results.append(payload)
                 if assistant_texts or tool_calls:
                     assistant_message: dict[str, Any] = {
@@ -2422,19 +2498,22 @@ class NativeRuntimeV2:
             return messages, base_prefix_len, []
         content = "## Runtime Prefetch\n" + "\n\n".join(prefetch_parts)
         prefetch_message = {"role": "system", "content": content}
-        insert_at = base_prefix_len - 1 if base_prefix_len > 1 else 1
-        updated_messages = [
-            *messages[:insert_at],
-            prefetch_message,
-            *messages[insert_at:],
-        ]
+        if self._separate_dynamic_context():
+            updated_messages = self._append_dynamic_context([
+                message for message in messages
+                if not (message.get("role") == "system" and str(message.get("content", "")).startswith("## Runtime Prefetch\n"))
+            ], [prefetch_message])
+        else:
+            insert_at = base_prefix_len - 1 if base_prefix_len > 1 else 1
+            updated_messages = [*messages[:insert_at], prefetch_message, *messages[insert_at:]]
+            base_prefix_len += 1
         await self._emit_runtime_event(
             runtime_session_id,
             task,
             "prefetch_consumed",
             {"query": handle.query[:500], "hits": hits},
         )
-        return updated_messages, base_prefix_len + 1, hits
+        return updated_messages, base_prefix_len, hits
 
     @staticmethod
     def _cancel_prefetch(handle: _RuntimePrefetchHandle | None) -> None:
@@ -2528,33 +2607,48 @@ class NativeRuntimeV2:
         task: Task | None,
         on_progress: Any,
     ) -> list[dict[str, Any]]:
-        ordered_results: list[dict[str, Any]] = []
-        remaining_calls: list[dict[str, Any]] = []
-        by_id: dict[str, dict[str, Any]] = {}
-        for index, call in enumerate(tool_calls):
-            early = early_tool_runs.get(index)
-            if not early:
-                remaining_calls.append(call)
-                continue
-            early_call = dict(early.get("call", {}) or {})
-            if not self._same_tool_call_signature(call, early_call):
-                if not early["task"].done():
-                    early["task"].cancel()
-                remaining_calls.append(call)
-                continue
-            result_items = await early["task"]
-            if result_items:
-                by_id[str(call.get("id", "") or "")] = result_items[0]
-        if remaining_calls:
-            for item in await executor.execute(remaining_calls, task=task, on_progress=on_progress):
-                by_id[str(item.get("tool_call", {}).get("id", "") or "")] = item
-        for call in tool_calls:
-            item = by_id.get(str(call.get("id", "") or ""))
-            if item is not None:
-                ordered_results.append(item)
-        return ordered_results
+        try:
+            ordered_results: list[dict[str, Any]] = []
+            remaining_calls: list[dict[str, Any]] = []
+            by_id: dict[str, dict[str, Any]] = {}
+            early_by_id = {str(item.get("call", {}).get("id", "") or ""): item
+                           for item in early_tool_runs.values()}
+            matched_tasks: set[asyncio.Task[Any]] = set()
+            for call in tool_calls:
+                early = early_by_id.get(str(call.get("id", "") or ""))
+                if not early:
+                    remaining_calls.append(call)
+                    continue
+                early_call = dict(early.get("call", {}) or {})
+                if not self._same_tool_call_signature(call, early_call):
+                    if not early["task"].done():
+                        early["task"].cancel()
+                    remaining_calls.append(call)
+                    continue
+                matched_tasks.add(early["task"])
+                result_items = await early["task"]
+                if result_items:
+                    by_id[str(call.get("id", "") or "")] = result_items[0]
+            unmatched = [item["task"] for item in early_tool_runs.values() if item["task"] not in matched_tasks]
+            for early_task in unmatched:
+                if not early_task.done():
+                    early_task.cancel()
+            if unmatched:
+                await asyncio.gather(*unmatched, return_exceptions=True)
+            if remaining_calls:
+                for item in await executor.execute(remaining_calls, task=task, on_progress=on_progress):
+                    by_id[str(item.get("tool_call", {}).get("id", "") or "")] = item
+            for call in tool_calls:
+                item = by_id.get(str(call.get("id", "") or ""))
+                if item is not None:
+                    ordered_results.append(item)
+            return ordered_results
+        finally:
+            await self._cancel_early_tool_runs(early_tool_runs)
 
     def _same_tool_call_signature(self, current: dict[str, Any], started: dict[str, Any]) -> bool:
+        if current.get("arguments_parse_error") or started.get("arguments_parse_error"):
+            return False
         if str(current.get("function", "") or "") != str(started.get("function", "") or ""):
             return False
         current_args = dict(current.get("arguments", {}) or {})
@@ -2821,6 +2915,34 @@ class NativeRuntimeV2:
                 return self.llm.sanitize_tool_call_history(candidate)
         return None
 
+    def _separate_dynamic_context(self) -> bool:
+        cfg = self.config.system.native_runtime.prompt_prefix_stability
+        return cfg.enabled and cfg.separate_dynamic_context
+
+    def _is_managed_dynamic_message(self, message: dict[str, Any]) -> bool:
+        if message.get("role") != "system":
+            return False
+        content = str(message.get("content", ""))
+        harness = self.config.system.native_runtime.prompt_harness
+        return content.startswith(("## Runtime Prefetch\n", "## Runtime Session Memory\n")) or (
+            harness.enabled and harness.artifact_messages_enabled and harness.reinject_after_compaction
+            and is_runtime_artifact_message(message)
+        )
+
+    @staticmethod
+    def _append_dynamic_context(messages: list[dict[str, Any]], dynamic: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Never insert system context between an approved pending ToolCall and
+        # its exact result. Bootstrap can end at this boundary during restart.
+        index = len(messages) - 1
+        while index >= 0 and messages[index].get("role") == "tool":
+            index -= 1
+        if index >= 0 and messages[index].get("tool_calls"):
+            calls = {str(item.get("id", "")) for item in messages[index]["tool_calls"]}
+            results = {str(item.get("tool_call_id", "")) for item in messages[index + 1:]}
+            if calls - results:
+                return [*messages[:index], *dynamic, *messages[index:]]
+        return [*messages, *dynamic]
+
     async def _apply_context_pipeline(
         self,
         messages: list[dict[str, Any]],
@@ -2840,6 +2962,14 @@ class NativeRuntimeV2:
         # and prompt-cache prefixes both depend on old messages staying
         # byte-identical. The only routine mutation is the idempotent
         # per-message tool-result budget (same clip an entry already got).
+        dynamic_tail: list[dict[str, Any]] = []
+        if self._separate_dynamic_context():
+            # Only runtime-owned blocks after the protected prefix are moved.
+            # Company policy, user messages and exact tool blocks keep order.
+            dynamic_tail = [item for item in messages[base_prefix_len:] if self._is_managed_dynamic_message(item)]
+            messages = [*messages[:base_prefix_len], *[
+                item for item in messages[base_prefix_len:] if not self._is_managed_dynamic_message(item)
+            ]]
         bounded = self._apply_tool_result_budget(messages)
         pipeline_steps = ["tool_result_budgeting"]
         compacted = bounded
@@ -2854,7 +2984,7 @@ class NativeRuntimeV2:
             )
             failures = int(runtime_notes.get("durable_compaction_failures", 0) or 0)
             if failures < breaker_limit:
-                compacted, durable_applied = await self._apply_durable_compaction(
+                compacted, durable_applied, durable_attempted = await self._apply_durable_compaction(
                     bounded,
                     task=task,
                     base_prefix_len=base_prefix_len,
@@ -2863,7 +2993,7 @@ class NativeRuntimeV2:
                 if durable_applied:
                     pipeline_steps.append("durable_compaction")
                     runtime_notes["durable_compaction_failures"] = 0
-                else:
+                elif durable_attempted:
                     runtime_notes["durable_compaction_failures"] = failures + 1
             if not durable_applied and force_compact:
                 # Emergency-only mechanical fallback: overflow pressure with
@@ -2893,6 +3023,7 @@ class NativeRuntimeV2:
                 "compaction_applied",
                 {"message_count": len(compacted)},
             )
+        compacted = self._append_dynamic_context(compacted, dynamic_tail)
         reinjected = await self._reinject_session_memory(compacted, task=task)
         artifact_reinjected = self._reinject_runtime_artifacts(
             reinjected,
@@ -2907,7 +3038,7 @@ class NativeRuntimeV2:
     def _apply_tool_result_budget(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         guard_budget = int(self.config.system.native_runtime.context_guard.tool_output_char_budget or 12_000)
         runtime_budget = int(self.config.system.native_runtime.tool_result_budget_chars or 20_000)
-        budget = min(runtime_budget, guard_budget)
+        budget = max(1, min(runtime_budget, guard_budget))
         compacted: list[dict[str, Any]] = []
         for message in messages:
             if message.get("role") == "tool":
@@ -2915,16 +3046,19 @@ class NativeRuntimeV2:
                 if len(content) > budget:
                     # Keep head and tail: openings carry the command/context,
                     # endings carry the verdict (exit codes, tracebacks).
-                    head = max(1, budget // 2)
-                    tail = max(0, budget - head)
-                    omitted = len(content) - head - tail
+                    omitted = len(content)
+                    while True:
+                        marker = f"\n[tool result truncated by runtime_v2: {omitted} chars omitted]\n"
+                        room = max(0, budget - len(marker))
+                        actual_omitted = len(content) - room
+                        if actual_omitted == omitted:
+                            break
+                        omitted = actual_omitted
+                    head = (room + 1) // 2
+                    tail = room - head
                     compacted.append({
                         **message,
-                        "content": (
-                            content[:head]
-                            + f"\n[tool result truncated by runtime_v2: {omitted} chars omitted]\n"
-                            + (content[-tail:] if tail else "")
-                        ),
+                        "content": content[:head] + marker[:budget] + (content[-tail:] if tail else ""),
                     })
                     continue
             compacted.append(message)
@@ -3082,17 +3216,17 @@ class NativeRuntimeV2:
         task: Task | None,
         base_prefix_len: int,
         runtime_session_id: str,
-    ) -> tuple[list[dict[str, Any]], bool]:
+    ) -> tuple[list[dict[str, Any]], bool, bool]:
         """Fold old messages into one LLM summary, keeping prefix and tail.
 
-        Returns (messages, applied). On any summarizer failure the original
+        Returns (messages, applied, attempted). On any summarizer failure the original
         list is returned unchanged so the caller can count failures and the
         model keeps seeing the full history for this round.
         """
         compactor = self.history_compactor
         summarize = getattr(compactor, "summarize_runtime_history", None) if compactor else None
         if not callable(summarize):
-            return messages, False
+            return messages, False, False
         preserve_recent = max(
             4,
             int(self.config.system.native_runtime.tool_aware_microcompact.preserve_recent_messages or 8),
@@ -3119,7 +3253,7 @@ class NativeRuntimeV2:
             fold_start += 1
         folded = messages[fold_start:start]
         if len(folded) < 4:
-            return messages, False
+            return messages, False, False
         try:
             summary = await summarize(
                 project_id=str(getattr(task, "project_id", "") or ""),
@@ -3128,10 +3262,10 @@ class NativeRuntimeV2:
             )
         except Exception as exc:
             logger.warning(f"Durable compaction failed; keeping full history this round: {exc}")
-            return messages, False
+            return messages, False, True
         summary_text = str(summary or "").strip()
         if not summary_text:
-            return messages, False
+            return messages, False, True
         summary_message = {
             "role": "user",
             "content": (
@@ -3140,7 +3274,7 @@ class NativeRuntimeV2:
                 "transcript remains persisted and queryable.\n\n" + summary_text
             ),
         }
-        return [*messages[:fold_start], summary_message, *messages[start:]], True
+        return [*messages[:fold_start], summary_message, *messages[start:]], True, True
 
     def _render_messages_for_compaction(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         per_message_budget = 4_000
@@ -3183,6 +3317,13 @@ class NativeRuntimeV2:
         if not task or not self.memory_manager or not task.session_id:
             return messages
         session_memory = await self.memory_manager.build_session_memory_context(task.session_id)
+        if self._separate_dynamic_context():
+            base = [item for item in messages if not (
+                item.get("role") == "system" and str(item.get("content", "")).startswith("## Runtime Session Memory\n")
+            )]
+            return self._append_dynamic_context(base, [{
+                "role": "system", "content": "## Runtime Session Memory\n" + session_memory,
+            }] if session_memory.strip() else [])
         if not session_memory.strip():
             return messages
         memory_message = {"role": "system", "content": session_memory}
@@ -3489,6 +3630,8 @@ class NativeRuntimeV2:
         if not artifact_messages:
             return strip_runtime_artifact_messages(messages)
         base_messages = strip_runtime_artifact_messages(messages)
+        if self._separate_dynamic_context():
+            return self._append_dynamic_context(base_messages, artifact_messages)
         insert_at = 1
         while insert_at < len(base_messages) and str(base_messages[insert_at].get("role", "") or "") == "system":
             insert_at += 1
@@ -4116,6 +4259,11 @@ class NativeRuntimeV2:
         normalized_thinking = str(thinking_text or "").strip()
         if normalized_thinking and is_task_mode:
             metadata["runtime_thinking"] = normalized_thinking
+            execution_id = (
+                self._runtime_iteration_turn_id(canonical_turn_id, iteration - 1)
+                if iteration is not None else message_turn_id
+            )
+            metadata["runtime_thinking_stream_id"] = f"{execution_id}:thinking"
         message = await self.memory_manager.append_session_message(
             session_id=task.session_id,
             role="assistant",
@@ -4137,6 +4285,7 @@ class NativeRuntimeV2:
                     "turn_id": canonical_turn_id,
                     "runtime_session_id": runtime_session_id,
                     "kind": "runtime_v2_thinking",
+                    "stream_id": metadata["runtime_thinking_stream_id"],
                 },
             )
         store = getattr(self.memory_manager, "store", None)
@@ -4250,8 +4399,7 @@ class NativeRuntimeV2:
         message = await self.memory_manager.append_session_message(
             session_id=task.session_id,
             role="assistant",
-            text=json.dumps(result, ensure_ascii=False, default=str),
-            part_type="tool_output",
+            text="",
             project_id=task.project_id,
             agent_id=task.assigned_to or None,
             task_id=task.id,
@@ -4272,7 +4420,8 @@ class NativeRuntimeV2:
             {
                 "tool_call_id": str(call.get("id", "") or ""),
                 "tool_name": str(call.get("function", "") or ""),
-                "result": result.get("result", result),
+                "result": result,
+                "result_format": "envelope_v1",
                 "permission_decision": {
                     "resolution": getattr(getattr(decision, "resolution", None), "value", ""),
                     "scope": getattr(getattr(decision, "scope", None), "value", ""),
@@ -4858,9 +5007,16 @@ class NativeRuntimeV2:
             "timestamp_ms": int(time.time() * 1000),
             **payload,
         }
+        buffer = self._delta_buffer.get()
+        if buffer is not None:
+            await buffer.push(event_payload)
+        else:
+            await self._write_runtime_event(event_payload)
+
+    async def _write_runtime_event(self, event_payload: dict[str, Any]) -> None:
         store = getattr(self.memory_manager, "store", None)
         if store and hasattr(store, "save_runtime_event"):
-            await store.save_runtime_event(runtime_session_id, event_type, event_payload)
+            await store.save_runtime_event(event_payload["runtime_session_id"], event_payload["type"], event_payload)
         if self.event_bus:
             await self.event_bus.publish(OPCEvent(event_type="runtime_event", payload=event_payload))
 

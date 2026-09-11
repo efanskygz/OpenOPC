@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { AttachmentRefMeta, ChatMessage, CheckpointReplyMetadata, InteractionReplyReceipt } from '../types/chat'
 import type { ProgressEntry, RoleWorkItemSummary, Session, WorkItemProgressEntry } from '../types/kanban'
+import { synthesizeThinkingEntries } from '../lib/thinkingProgress'
 import { progressEntryKey } from '../lib/progressEntryKey'
 import { stableMessageTimelineKey } from '../lib/messageTimelineIdentity'
 import { isMessageVisibleAtDetailLevel, resultSurfaceDedupeKey } from '../lib/workItemSessions'
@@ -1276,37 +1277,15 @@ export const MessageList = React.memo(function MessageList({
   )
   // Checkpoint cards never leave the chronological transcript. Their pending
   // state only controls the fixed reminder rendered outside the scroll flow.
-  const timelineMessages = filteredMessages
+  const timelineMessages = useMemo(
+    () => filteredMessages.filter(message => !message.metadata?.runtime_thinking_only),
+    [filteredMessages],
+  )
 
-  const thinkingProgressTurnIds = useMemo(() => {
-    const ids = new Set<string>()
-    for (const entry of progressLog ?? []) {
-      if (entry.type !== 'thinking') continue
-      const turnId = String(entry.turnId ?? '').trim()
-      if (turnId) ids.add(turnId)
-    }
-    return ids
-  }, [progressLog])
-  const synthesizedThinkingEntries = useMemo(() => {
-    const entries: ProgressEntry[] = []
-    for (const message of timelineMessages) {
-      const thinking = String(message.metadata?.runtime_thinking ?? '').trim()
-      if (!thinking) continue
-      const turnId = resolveCanonicalTurnId(message.metadata)
-      if (turnId && thinkingProgressTurnIds.has(turnId)) continue
-      entries.push({
-        type: 'thinking' as const,
-        summary: 'Thinking',
-        detail: thinking,
-        timestamp: Math.max(0, message.timestamp - 1),
-        turnId: turnId || undefined,
-        itemId: turnId ? `${turnId}:thinking` : `thinking:${message.id}`,
-        streamId: turnId ? `${turnId}:thinking` : `thinking:${message.id}`,
-        executionMode: String(message.metadata?.execution_mode ?? '').trim() || undefined,
-      })
-    }
-    return entries
-  }, [thinkingProgressTurnIds, timelineMessages])
+  const synthesizedThinkingEntries = useMemo(
+    () => synthesizeThinkingEntries(filteredMessages, progressLog ?? []),
+    [filteredMessages, progressLog],
+  )
   const inlineProgressEntries = useMemo(
     () => showRuntimeProgress
       ? [
@@ -1326,9 +1305,9 @@ export const MessageList = React.memo(function MessageList({
     () => !showRuntimeProgress
       ? []
       : detailMode === 'full'
-        ? (progressLog ?? [])
+        ? [...(progressLog ?? []), ...synthesizedThinkingEntries].sort((a, b) => a.timestamp - b.timestamp)
         : inlineProgressEntries,
-    [detailMode, inlineProgressEntries, progressLog, showRuntimeProgress],
+    [detailMode, inlineProgressEntries, progressLog, showRuntimeProgress, synthesizedThinkingEntries],
   )
   const bottomProgressEntries = secondaryProgressEntries
   const committedTurnIds = useMemo(() => {

@@ -410,6 +410,8 @@ export interface ChatMessageMeta {
   execution_mode?: string
   transcript_kind?: string
   detail_visibility?: DetailVisibility
+  runtime_thinking_only?: boolean
+  runtime_thinking_stream_id?: string
   runtime_thinking?: string
   runtime_iteration?: number
   stop_reason?: string

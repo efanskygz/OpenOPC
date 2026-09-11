@@ -296,6 +296,8 @@ export const StaffingSelectionPanel = React.memo(function StaffingSelectionPanel
       <div className="ckpt-staffing-grid">
         {roles.map(role => {
           const roleId = String(role.role_id ?? '').trim()
+          // The engine expands legacy locked cards before exposing editable
+          // roles. Keep this fallback for older servers and historical cards.
           const persistedExternalTeam = role.staffing_locked && role.staffing_mode === 'opaque_external_team'
           const dynamicBoundaryRoleId = dynamicTeamCoverage.boundaryByRole.get(roleId) ?? ''
           const dynamicTeamBoundary = dynamicBoundaryRoleId === roleId
@@ -326,6 +328,7 @@ export const StaffingSelectionPanel = React.memo(function StaffingSelectionPanel
                   <b>{dynamicTeamCovered && !dynamicTeamBoundary ? `Covered by Team at ${dynamicBoundaryRoleId}` : 'Internally staffed external team'}</b>
                   <span>One opaque Team covers: {coveredRoleIds.join(', ')}</span>
                   <span>No OPC employees are recruited for these covered roles.</span>
+                  {dynamicTeamBoundary && !isResponded && <span>Choose another execution agent here to staff these roles individually.</span>}
                 </div>
               ) : <div className="ckpt-staffing-selected">
                 <div className="ckpt-cand-name">{selected.name}</div>

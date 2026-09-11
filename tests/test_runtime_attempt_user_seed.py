@@ -640,7 +640,8 @@ class RuntimeAttemptUserSeedTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result_one.status, TaskStatus.DONE)
-        first_model_messages = llm.message_batches[-1]
+        # Runtime-owned dynamic system context is appended after conversation history.
+        first_model_messages = [item for item in llm.message_batches[-1] if item["role"] != "system"]
         self.assertEqual(first_model_messages[-1]["role"], "user")
         self.assertEqual(first_model_messages[-1]["content"], round_one)
         self.assertEqual(
@@ -668,7 +669,7 @@ class RuntimeAttemptUserSeedTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result_two.status, TaskStatus.DONE)
-        second_model_messages = llm.message_batches[-1]
+        second_model_messages = [item for item in llm.message_batches[-1] if item["role"] != "system"]
         self.assertEqual(second_model_messages[-1]["role"], "user")
         self.assertEqual(second_model_messages[-1]["content"], round_two)
         self.assertEqual(

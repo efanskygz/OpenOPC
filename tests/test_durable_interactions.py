@@ -1870,7 +1870,8 @@ def test_restart_executes_exact_original_tool_call_once_without_llm_regeneration
         assert executed == ["original"]
         assert store.finish_calls == 1
         assert len(store.results) == 1
-        first_llm_messages = llm.seen_messages[0]
+        # Dynamic system context may follow the completed exact call/result block.
+        first_llm_messages = [message for message in llm.seen_messages[0] if message["role"] != "system"]
         assert first_llm_messages[-1]["role"] == "tool"
         assert first_llm_messages[-1]["tool_call_id"] == "call-1"
         assert first_llm_messages[-2]["role"] == "assistant"
@@ -1976,8 +1977,10 @@ def test_restart_persists_canonical_denied_exact_tool_result_without_execution()
         assert store.results[0]["metadata"]["permission_decision"][
             "resolution"
         ] == "deny"
-        assert llm.seen_messages[0][-1]["role"] == "tool"
-        assert llm.seen_messages[0][-1]["tool_call_id"] == permit["id"]
+        first_llm_messages = [message for message in llm.seen_messages[0] if message["role"] != "system"]
+        assert first_llm_messages[-1]["role"] == "tool"
+        assert first_llm_messages[-1]["tool_call_id"] == permit["id"]
+        assert first_llm_messages[-2]["tool_calls"][0]["id"] == permit["id"]
         assert "approved_tool_calls" not in task.context_snapshot["runtime_resume"]
 
     asyncio.run(scenario())

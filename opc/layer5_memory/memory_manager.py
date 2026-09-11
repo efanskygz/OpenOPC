@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from opc.core.session_parts import normalized_session_parts
+
 import json
 import re
 from datetime import datetime
@@ -1459,14 +1461,15 @@ class MemoryManager:
 
     def _render_session_parts(self, parts: list[SessionPartRecord]) -> str:
         rendered_parts: list[str] = []
-        for part in parts:
-            payload = dict(part.payload)
-            if part.part_type == "text":
+        for part_type, payload in normalized_session_parts(parts):
+            if part_type == "thinking":
+                continue
+            if part_type == "text":
                 text = str(payload.get("text", "")).strip()
                 if text:
                     rendered_parts.append(text)
                 continue
-            if part.part_type == "subtask_result":
+            if part_type == "subtask_result":
                 title = payload.get("task_title") or payload.get("child_session_id") or "child task"
                 summary = str(payload.get("summary", "")).strip()
                 artifacts = payload.get("artifacts") or {}
@@ -1479,24 +1482,24 @@ class MemoryManager:
                     lines.extend(f"- {line}" for line in artifact_lines)
                 rendered_parts.append("\n".join(lines))
                 continue
-            if part.part_type == "task_result":
+            if part_type == "task_result":
                 title = payload.get("task_title") or payload.get("task_id") or "task"
                 outcome = str(payload.get("summary", "")).strip()
                 rendered_parts.append(f"Task result: {title}\n{outcome}".strip())
                 continue
-            if part.part_type == "tool_output":
+            if part_type == "tool_output":
                 name = payload.get("tool_name", "tool")
                 output = str(payload.get("output", "")).strip()
                 rendered_parts.append(f"Tool output [{name}]\n{output}".strip())
                 continue
-            if part.part_type == "tool_result":
+            if part_type == "tool_result":
                 name = payload.get("tool_name", "tool")
                 output = payload.get("result", {})
                 if not isinstance(output, str):
                     output = json.dumps(output, ensure_ascii=False, default=str)
                 rendered_parts.append(f"Tool result [{name}]\n{str(output).strip()}".strip())
                 continue
-            if part.part_type == "tool_call":
+            if part_type == "tool_call":
                 name = payload.get("tool_name", "tool")
                 arguments = payload.get("arguments", {})
                 rendered_parts.append(

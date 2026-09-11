@@ -1556,35 +1556,6 @@ class OPCEngine:
             if not role_id or role_id == "task_generalist":
                 continue
             external_team = external_team_by_role.get(role_id)
-            if external_team is not None:
-                if role_id != external_team.boundary_role_id:
-                    # The organization node remains visible, but Jiuwen owns
-                    # its internal staffing and no OPC hire is requested.
-                    continue
-                roles.append(
-                    {
-                        "role_id": role_id,
-                        "role_label": str(getattr(agent, "name", "") or role_id),
-                        "role_responsibility": str(
-                            getattr(agent, "responsibility", "") or ""
-                        ),
-                        "reports_to": str(getattr(agent, "reports_to", "") or ""),
-                        "default_selection": {"kind": "fallback"},
-                        "same_role_employee_ids": [],
-                        "fallback_available": False,
-                        "default_agent": external_team.external_agent,
-                        "selected_agent": external_team.external_agent,
-                        "default_source": "external_team_binding",
-                        "staffing_locked": True,
-                        "staffing_mode": "opaque_external_team",
-                        "external_team_binding_id": external_team.binding_id,
-                        "covered_role_ids": list(external_team.covered_role_ids),
-                        "capability_manifest": copy.deepcopy(
-                            external_team.capability_manifest
-                        ),
-                    }
-                )
-                continue
             role_preferred_agent = normalize_recruitment_agent_choice(
                 getattr(agent, "preferred_external_agent", None)
             )
@@ -1604,6 +1575,11 @@ class OPCEngine:
                     and str(getattr(agent, "reports_to", "") or "").strip() != "owner"
                     else requested_default_agent
                 )
+            elif external_team is not None and role_id == external_team.boundary_role_id:
+                # Organization bindings are defaults for this run. Keep every
+                # role in the card so changing a Team boundary restores its
+                # descendants' individual staffing and executor choices.
+                default_agent = external_team.external_agent
             elif (
                 role_preferred_agent
                 and role_preferred_agent != "native"
@@ -1680,9 +1656,6 @@ class OPCEngine:
         }
         has_employees = bool(employee_payloads)
         has_templates = bool(template_payloads)
-        external_team_count = len({
-            team.binding_id for team in external_team_by_role.values()
-        })
         if has_employees:
             staffing_strategy = "existing_staffing"
             recommended_action = "manual_approve"
@@ -1695,12 +1668,11 @@ class OPCEngine:
             staffing_strategy = "role_only_fallback"
             recommended_action = "manual_approve"
             summary = "No employees or talent templates are available. Approving will use role-only fallback execution."
-        if external_team_count:
-            summary += (
-                f" {external_team_count} external JiuwenSwarm-team"
-                f"{'s are' if external_team_count != 1 else ' is'} already staffed internally; "
-                "covered roles require no separate hires."
-            )
+        summary += (
+            " Execution agents can be changed for this run. A selected "
+            "JiuwenSwarm-team covers its role and descendants; change the "
+            "Team boundary's agent to restore individual staffing."
+        )
         return {
             "original_message": original_message,
             "decision": self._serialize_router_decision(decision),
@@ -1790,7 +1762,56 @@ class OPCEngine:
             "org_id": org_id,
         }
 
+    def _editable_manual_staffing_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Expand legacy locked Team cards without rewriting checkpoint identity.
+
+        Use the same view for UI projection and reply consumption. Old pending
+        checkpoints omitted descendants, so merely enabling their selects would
+        leave those roles unavailable for staffing after switching away from Team.
+        """
+        old_roles = list(payload.get("staffing_roles", []) or [])
+        if not any(
+            isinstance(role, dict) and role.get("staffing_locked")
+            and role.get("staffing_mode") == "opaque_external_team"
+            for role in old_roles
+        ):
+            return payload
+        if not self.org_engine or not self.talent_market:
+            return payload
+        decision = self._deserialize_router_decision(dict(payload.get("decision", {}) or {}))
+        runtime_spec = deserialize_company_runtime_spec(dict(payload.get("runtime_spec", {}) or {}))
+        fresh = self._build_manual_staffing_checkpoint_payload(
+            decision, str(payload.get("original_message", "")), runtime_spec,
+            session_id=str(payload.get("primary_session_id", "")),
+            origin_channel=str(payload.get("origin_channel", "ui")),
+            origin_chat_id=str(payload.get("origin_chat_id", "")),
+            origin_thread_id=str(payload.get("origin_thread_id", "")),
+        )
+        if fresh is None:
+            return payload
+        old_by_role = {role["role_id"]: role for role in old_roles if isinstance(role, dict) and role.get("role_id")}
+        roles = []
+        for fresh_role in fresh["staffing_roles"]:
+            role = dict(fresh_role)
+            old = old_by_role.get(role["role_id"], {})
+            if old and not old.get("staffing_locked"):
+                role.update(old)
+            elif old:
+                # Keep the previous Team selection, but recover normal employee
+                # defaults and descendant entries from the current organization.
+                role["selected_agent"] = old.get("selected_agent") or "jiuwenswarm"
+            roles.append(role)
+        agents = {role["role_id"]: role["selected_agent"] for role in roles}
+        agents.update(dict(payload.get("recruitment_role_agents", {}) or {}))
+        return {
+            **payload,
+            "staffing_roles": roles,
+            "recruitment_role_agents": agents,
+            "summary": fresh["summary"],
+        }
+
     def _render_manual_staffing_summary(self, payload: dict[str, Any]) -> str:
+        payload = self._editable_manual_staffing_payload(payload)
         employees_by_id = {
             str(item.get("employee_id", "") or ""): item
             for item in list(dict(payload.get("staffing_pool", {}) or {}).get("employees", []) or [])
@@ -2720,6 +2741,17 @@ class OPCEngine:
         origin_interaction_lease: OriginOwnerInteractionLease | None = None,
     ) -> str:
         assert self.company_recruiter
+        recruitment_scope: dict[str, Any] = {}
+        if decision.mode == ExecutionMode.COMPANY_MODE:
+            role_agent_overrides = self._company_execution_agent_defaults(decision, role_agent_overrides)
+            compiled_teams, role_agent_overrides = self._apply_staffing_external_team_bindings(
+                {}, {"recruitment_role_agents": role_agent_overrides},
+            )
+            for team in compiled_teams:
+                role_agent_overrides[team.boundary_role_id] = team.external_agent
+            recruitment_scope["externally_staffed_role_ids"] = {
+                role_id for team in compiled_teams for role_id in team.covered_role_ids
+            }
         recruitment_llm, selected_recruitment_agent = self._resolve_recruitment_llm(recruitment_agent)
         recruitment_plan = await self.company_recruiter.build_recruitment_plan(
             runtime_spec,
@@ -2727,6 +2759,7 @@ class OPCEngine:
             project_id=self.project_id or "default",
             recruitment_llm=recruitment_llm,
             recruitment_agent=selected_recruitment_agent,
+            **recruitment_scope,
         )
         recruitment_plan.metadata = dict(getattr(recruitment_plan, "metadata", {}) or {})
         recruitment_plan.metadata.setdefault("recruitment_revision", 1)
@@ -3225,6 +3258,7 @@ class OPCEngine:
     ) -> str:
         assert self.store and self.memory
         project_id = self.project_id or "default"
+        role_agent_overrides = self._company_execution_agent_defaults(decision, role_agent_overrides)
         compiled_external_teams, role_agent_overrides = (
             self._apply_staffing_external_team_bindings(
                 {"staffing_roles": []},
@@ -3268,6 +3302,7 @@ class OPCEngine:
             staffing_experience_modes=staffing_experience_modes,
             fallback_role_ids=fallback_role_ids,
             role_agent_overrides=role_agent_overrides,
+            compiled_external_teams=compiled_external_teams,
         )
         # Organization structure remains visible, while configured Jiuwen
         # Team subtrees become one dispatchable execution unit.
@@ -3496,20 +3531,20 @@ class OPCEngine:
         staffing_experience_modes: dict[str, str] | None = None,
         fallback_role_ids: set[str] | None = None,
         role_agent_overrides: dict[str, str] | None = None,
+        compiled_external_teams: list[Any] | None = None,
     ) -> dict[str, Any]:
         if not self.org_engine:
             return runtime_topology
         enriched = copy.deepcopy(runtime_topology)
-        from opc.layer2_organization.external_team_compiler import (
-            compile_external_team_bindings,
-        )
+        if compiled_external_teams is None:
+            from opc.layer2_organization.external_team_compiler import compile_external_team_bindings
 
+            compiled_external_teams = compile_external_team_bindings(
+                self.org_engine, runtime_topology=enriched,
+            )
         external_team_covered_roles = {
             role_id
-            for team in compile_external_team_bindings(
-                self.org_engine,
-                runtime_topology=enriched,
-            )
+            for team in compiled_external_teams
             for role_id in team.covered_role_ids
         }
         fallback_roles = {
@@ -19648,6 +19683,19 @@ class OPCEngine:
         )
         return boundaries, role_agents
 
+    def _company_execution_agent_defaults(
+        self, decision: RouterDecision, role_agent_overrides: dict[str, str] | None,
+    ) -> dict[str, str]:
+        agents = dict(role_agent_overrides or {})
+        explicit_agent = normalize_recruitment_agent_choice(decision.preferred_agent)
+        if explicit_agent and self.org_engine:
+            for role in self.org_engine.list_agents():
+                agents.setdefault(
+                    role.role_id,
+                    "native" if explicit_agent == "jiuwenswarm" and role.reports_to != "owner" else explicit_agent,
+                )
+        return agents
+
     def _durable_external_team_bindings(self) -> list[Any]:
         """Return organization-level bindings, excluding prior run selections."""
 
@@ -19691,7 +19739,14 @@ class OPCEngine:
         )
 
         topology = self.org_engine.build_runtime_delegation_topology()
-        existing = self._durable_external_team_bindings()
+        # A per-run executor choice overrides the organization's default
+        # boundary. Never change the shared configuration while compiling a run.
+        existing = [
+            copy.deepcopy(binding)
+            for binding in self._durable_external_team_bindings()
+            if binding.enabled
+            and role_agents.get(binding.boundary_role_id, "jiuwenswarm") == "jiuwenswarm"
+        ]
         compile_external_team_bindings(
             self.org_engine,
             runtime_topology=topology,
@@ -19818,7 +19873,7 @@ class OPCEngine:
         origin_interaction_lease: OriginOwnerInteractionLease | None = None,
     ) -> str:
         assert self.store and self.talent_market
-        payload = checkpoint.payload
+        payload = self._editable_manual_staffing_payload(checkpoint.payload)
         original_message = str(payload.get("original_message", ""))
         if not original_message:
             return "Could not resume staffing because the original request is missing."
@@ -19863,10 +19918,8 @@ class OPCEngine:
             except ValueError as exc:
                 return f"Could not apply JiuwenSwarm-team staffing: {exc}"
             await self._publish_external_team_bindings_changed(compiled_teams)
-            _, role_agent_overrides = self._filter_staffing_for_external_teams(
-                compiled_teams,
-                role_agent_overrides,
-            )
+            # Preserve dormant descendant choices through recruitment; only
+            # the final execution graph removes roles covered by a Team.
             recruitment_agent = normalize_recruitment_agent_choice(
                 reply_metadata.get("recruitment_agent") or payload.get("recruitment_agent"),
                 default="native",
@@ -20331,6 +20384,16 @@ class OPCEngine:
             return recruitment_plan.summary or self.company_recruiter.render_recruitment_summary(recruitment_plan)
         feedback_history = list(recruitment_plan.recruiter_feedback)
         feedback_history.append(feedback)
+        recruitment_scope: dict[str, Any] = {}
+        if decision.mode == ExecutionMode.COMPANY_MODE:
+            compiled_teams, role_agent_overrides = self._apply_staffing_external_team_bindings(
+                {}, {"recruitment_role_agents": role_agent_overrides},
+            )
+            for team in compiled_teams:
+                role_agent_overrides[team.boundary_role_id] = team.external_agent
+            recruitment_scope["externally_staffed_role_ids"] = {
+                role_id for team in compiled_teams for role_id in team.covered_role_ids
+            }
         recruitment_llm, selected_recruitment_agent = self._resolve_recruitment_llm(recruitment_agent)
         revised_plan = await self.company_recruiter.build_recruitment_plan(
             runtime_spec,
@@ -20339,10 +20402,11 @@ class OPCEngine:
             recruiter_feedback=feedback_history,
             recruitment_llm=recruitment_llm,
             recruitment_agent=selected_recruitment_agent,
+            **recruitment_scope,
         )
         apply_recruitment_role_agent_overrides(
             revised_plan,
-            extract_recruitment_role_agent_overrides(recruitment_plan),
+            role_agent_overrides,
         )
         try:
             current_revision = int(

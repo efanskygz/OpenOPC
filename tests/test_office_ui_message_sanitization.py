@@ -31,6 +31,27 @@ def test_strip_trailing_verification_footer_keeps_footer_only_message() -> None:
     assert footer is None
 
 
+def test_thinking_only_tool_iteration_survives_snapshot_backfill() -> None:
+    item = {
+        "message": SimpleNamespace(
+            message_id="thinking-only", role="assistant", agent_id="", created_at=datetime.now(), summary_flag=False,
+            metadata={"kind": "runtime_v2_intermediate_assistant", "canonical_turn_id": "turn",
+                      "ui_message_id": "runtime-v2-intermediate-assistant:turn:iter:2",
+                      "runtime_thinking_stream_id": "turn:iter:2:thinking"},
+        ),
+        "parts": [SimpleNamespace(part_type="thinking", payload={"text": "thinking round two"})],
+    }
+    mapped = _transcript_item_to_ui_message(item, channel_id="session:t1", task_id="t1")
+    assert mapped is not None
+    assert mapped["metadata"]["runtime_thinking"] == "thinking round two"
+    assert mapped["metadata"]["runtime_thinking_stream_id"] == "turn:iter:2:thinking"
+    assert mapped["metadata"]["runtime_thinking_only"] is True
+    assert mapped["metadata"]["ui_message_id"] == mapped["message_id"]
+    full = _transcript_item_to_ui_message(item, channel_id="session:t1", task_id="t1", detail_level="full")
+    assert full is not None
+    assert full["message_id"] != mapped["message_id"]
+
+
 def test_sanitize_ui_message_dict_strips_assistant_footer_and_preserves_metadata() -> None:
     message = {
         "message_id": "m1",

@@ -25,6 +25,7 @@ from opc.core.transcript_visibility import (
     TranscriptDetailLevel,
     normalize_transcript_detail_level,
     transcript_metadata_visible,
+    has_iteration_thinking,
 )
 from opc.layer2_organization.phase import (
     DONE_PHASES,
@@ -1089,7 +1090,13 @@ def _transcript_item_to_ui_message(
     ):
         return None
 
+    message_metadata = dict(getattr(message, "metadata", {}) or {})
+    runtime_thinking = (
+        _render_thinking_parts(item.get("parts", []))
+        or str(message_metadata.get("runtime_thinking", "") or "").strip()
+    )
     kind = _transcript_message_kind(message)
+    thinking_only = detail_level != "full" and has_iteration_thinking(message_metadata)
     if kind in _FULL_DETAIL_ONLY_TRANSCRIPT_KINDS:
         content = _render_text_parts(item.get("parts", []))
     else:
@@ -1097,7 +1104,7 @@ def _transcript_item_to_ui_message(
     content = content.strip()
     if kind == "runtime_v2_user_turn":
         content = _summarize_runtime_user_turn(content)
-    if not content:
+    if not content and not runtime_thinking:
         return None
 
     role = str(getattr(message, "role", "") or "").strip().lower()
@@ -1125,17 +1132,16 @@ def _transcript_item_to_ui_message(
 
     if role != "user":
         content, verification_footer = _strip_trailing_verification_footer(content)
-        if not content:
+        if not content and not runtime_thinking:
             return None
     else:
         verification_footer = None
 
     message_id, timestamp, ui_meta = _session_message_ui_identity(message)
-    message_metadata = dict(getattr(message, "metadata", {}) or {})
-    runtime_thinking = (
-        _render_thinking_parts(item.get("parts", []) if isinstance(item, dict) else [])
-        or str(message_metadata.get("runtime_thinking", "") or "").strip()
-    )
+    if thinking_only:
+        content = ""
+        message_id = f"runtime-v2-thinking:{message_metadata['runtime_thinking_stream_id']}"
+        ui_meta["ui_message_id"] = message_id
     return {
         "message_id": message_id or str(getattr(message, "message_id", "") or str(uuid.uuid4())),
         "channel_id": channel_id,
@@ -1169,6 +1175,7 @@ def _transcript_item_to_ui_message(
                     "child_session_id",
                     "conversation_turn_id",
                     "execution_turn_id",
+                    "runtime_thinking_stream_id",
                     "work_item_projection_id",
                     "work_item_turn_type",
                     "runtime_session_id",
@@ -1176,6 +1183,7 @@ def _transcript_item_to_ui_message(
                 if message_metadata.get(key)
             }),
             **ui_meta,
+            **({"runtime_thinking_only": True, "detail_visibility": "summary"} if thinking_only else {}),
         },
     }
 
@@ -1255,7 +1263,7 @@ def build_transcript_ui_messages(
             item,
             channel_id=channel_id,
             task_id=task_id,
-            detail_level="full",
+            detail_level=detail_level,
         )
         if not formatted:
             continue
@@ -2498,6 +2506,11 @@ async def _build_snapshot_checkpoint_meta(engine: "OPCEngine", task: Any) -> dic
         }
 
     if checkpoint_type == "company_staffing_selection":
+        editable_payload = getattr(engine, "_editable_manual_staffing_payload", None)
+        if callable(editable_payload) and str(getattr(checkpoint, "status", "pending")) == "pending":
+            expanded = editable_payload(payload)
+            if isinstance(expanded, dict):
+                payload = expanded
         org_engine = getattr(engine, "org_engine", None)
         reports_to_by_role = {
             str(getattr(agent, "role_id", "") or "").strip(): str(

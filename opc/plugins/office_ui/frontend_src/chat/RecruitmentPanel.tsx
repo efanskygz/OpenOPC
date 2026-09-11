@@ -307,6 +307,8 @@ export const RecruitmentPanel = React.memo(function RecruitmentPanel({
       <div className="ckpt-staffing-grid">
         {roles.map(role => {
           const roleId = String(role.role_id ?? '').trim()
+          // Preserve the legacy-server fallback; current staffing is resolved
+          // per run and Team boundaries arrive without this old lock flag.
           const persistedExternalTeam = role.staffing_locked && role.staffing_mode === 'opaque_external_team'
           const dynamicBoundaryRoleId = dynamicTeamCoverage.boundaryByRole.get(roleId) ?? ''
           const dynamicTeamBoundary = dynamicBoundaryRoleId === roleId
@@ -338,6 +340,7 @@ export const RecruitmentPanel = React.memo(function RecruitmentPanel({
                   <b>{dynamicTeamCovered && !dynamicTeamBoundary ? `Covered by Team at ${dynamicBoundaryRoleId}` : 'Internally staffed external team'}</b>
                   <span>One opaque Team covers: {coveredRoleIds.join(', ')}</span>
                   <span>No OPC employees are recruited for these covered roles.</span>
+                  {dynamicTeamBoundary && !isResponded && <span>Choose another execution agent here to staff these roles individually.</span>}
                 </div>
               ) : <div className="ckpt-staffing-selected">
                 <div className="ckpt-cand-name">{selectedRecruitmentName(proposal, selected)}</div>

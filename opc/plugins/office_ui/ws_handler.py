@@ -8264,6 +8264,11 @@ class WSHandler:
         """Extract manual staffing data into frontend-friendly metadata."""
         payload = dict(cp.payload or {})
         runtime_engine = engine or self.engine
+        editable_payload = getattr(runtime_engine, "_editable_manual_staffing_payload", None)
+        if callable(editable_payload) and str(getattr(cp, "status", "pending")) == "pending":
+            expanded = editable_payload(payload)
+            if isinstance(expanded, dict):
+                payload = expanded
         org_engine = getattr(runtime_engine, "org_engine", None)
         reports_to_by_role = {
             str(getattr(agent, "role_id", "") or "").strip(): str(

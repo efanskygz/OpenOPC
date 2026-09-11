@@ -428,6 +428,7 @@ class CompanyRecruiter:
         recruiter_feedback: list[str] | None = None,
         recruitment_llm: Any | None = None,
         recruitment_agent: str | None = None,
+        externally_staffed_role_ids: set[str] | None = None,
     ) -> RecruitmentPlan:
         domains = list(domains or [])
         feedback = list(recruiter_feedback or [])
@@ -436,7 +437,7 @@ class CompanyRecruiter:
             recruitment_agent,
             default="native",
         ) or "native"
-        needs = self._collect_needs(runtime_spec)
+        needs = self._collect_needs(runtime_spec, externally_staffed_role_ids=externally_staffed_role_ids)
         triage_by_role = await self._triage_staffing_for_needs(
             needs,
             recruiter_feedback=feedback,
@@ -489,6 +490,19 @@ class CompanyRecruiter:
                 self._heuristic_proposal_for_prepared_need(item, project_id=project_id)
                 for item in prepared_needs
             ]
+        if externally_staffed_role_ids is not None:
+            # Keep covered roles editable in the confirmation card without
+            # asking the recruiter to hire anyone for an opaque Team.
+            proposals.extend(
+                RecruitmentProposal(
+                    role_id=agent.role_id,
+                    role_labels=[agent.name],
+                    status="direct_role_execution",
+                    rationale="Covered by the selected external Team; no separate hire is needed.",
+                )
+                for agent in self.org_engine.list_agents()
+                if agent.role_id in externally_staffed_role_ids
+            )
         plan_metadata = {
             "project_id": project_id,
             "execution_mode": str(getattr(runtime_spec, "metadata", {}).get("execution_mode", "company_mode") or "company_mode"),
@@ -589,7 +603,9 @@ class CompanyRecruiter:
         )
         return "\n".join(lines)
 
-    def _collect_needs(self, runtime_spec: Any) -> list[RecruitmentNeed]:
+    def _collect_needs(
+        self, runtime_spec: Any, *, externally_staffed_role_ids: set[str] | None = None,
+    ) -> list[RecruitmentNeed]:
         """One staffing need per role in the live org topology.
 
         Recruitment runs once before execution enters the org, so it does not
@@ -603,7 +619,8 @@ class CompanyRecruiter:
             or ""
         ).strip()
         grouped: dict[str, RecruitmentNeed] = {}
-        externally_staffed_role_ids = self._opaque_external_team_covered_roles()
+        if externally_staffed_role_ids is None:
+            externally_staffed_role_ids = self._opaque_external_team_covered_roles()
         # Roles in the active topology.
         for agent in self.org_engine.list_agents():
             role_id = str(getattr(agent, "role_id", "") or "").strip()

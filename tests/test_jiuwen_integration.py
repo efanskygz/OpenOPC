@@ -640,7 +640,7 @@ def test_opaque_team_roles_are_not_recruited_separately() -> None:
     } & recruited_role_ids
 
 
-def test_manual_staffing_exposes_one_locked_team_boundary() -> None:
+def test_manual_staffing_keeps_configured_team_boundary_and_descendants_editable() -> None:
     binding = ExternalTeamBindingConfig(boundary_role_id="cto")
     config = OPCConfig()
     config.org.company_profile = "corporate"
@@ -668,18 +668,15 @@ def test_manual_staffing_exposes_one_locked_team_boundary() -> None:
     )
     assert payload is not None
     roles = {role["role_id"]: role for role in payload["staffing_roles"]}
-    assert roles["cto"]["staffing_locked"] is True
+    assert not any(role.get("staffing_locked") for role in roles.values())
     assert roles["cto"]["selected_agent"] == "jiuwenswarm"
-    assert set(roles["cto"]["covered_role_ids"]) == {
+    assert {
         "cto",
         "senior_engineer",
         "devops_engineer",
         "env_engineer",
-    }
-    assert "senior_engineer" not in roles
-    assert "devops_engineer" not in roles
-    assert "env_engineer" not in roles
-    assert "require no separate hires" in payload["summary"]
+    }.issubset(roles)
+    assert "can be changed for this run" in payload["summary"]
 
 
 def test_company_global_jiuwenswarm_defaults_to_top_level_team_only() -> None:

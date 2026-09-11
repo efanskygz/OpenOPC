@@ -45,6 +45,35 @@ Both are independent and can execute in parallel."""
 
 
 class TranscriptStorePaginationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_summary_pages_expose_iteration_thinking_without_raw_company_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            try:
+                await store.save_session(SessionRecord(session_id="thinking", project_id="test-project"))
+                for index, kind in enumerate(("runtime_v2_intermediate_assistant", "runtime_v2_company_assistant")):
+                    metadata = {"kind": kind, "runtime_thinking_stream_id": f"turn:{index}:thinking", "runtime_thinking": f"thought {index}"}
+                    await store.save_session_message(SessionMessageRecord(
+                        message_id=f"m{index}", session_id="thinking", role="assistant", metadata=metadata,
+                    ))
+                    await store.save_session_part(SessionPartRecord(
+                        part_id=f"p{index}", message_id=f"m{index}", session_id="thinking",
+                        part_type="text", payload={"text": "raw intermediate text"},
+                    ))
+                page = await store.get_session_transcript_page("thinking", detail_level="summary", limit=1)
+                self.assertEqual(page["total_count"], 1)
+                rendered = build_transcript_ui_messages(page["messages"], channel_id="session:thinking", task_id="task")
+                self.assertEqual(len(rendered), 1)
+                self.assertEqual(rendered[0]["content"], "")
+                self.assertEqual(rendered[0]["metadata"]["runtime_thinking"], "thought 0")
+                full_page = await store.get_session_transcript_page("thinking", detail_level="full")
+                full = build_transcript_ui_messages(full_page["messages"], channel_id="session:thinking", task_id="task", detail_level="full")
+                self.assertEqual(len(full), 2)
+                self.assertTrue(all(row["content"] == "raw intermediate text" for row in full))
+                self.assertNotEqual(full[0]["message_id"], rendered[0]["message_id"])
+            finally:
+                await store.close()
+
     async def test_summary_page_filters_full_detail_rows_before_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = OPCStore(Path(tmpdir) / "tasks.db")

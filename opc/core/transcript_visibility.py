@@ -25,6 +25,14 @@ def normalize_transcript_detail_level(value: Any) -> TranscriptDetailLevel:
     return "full" if str(value or "").strip().lower() == "full" else "summary"
 
 
+def has_iteration_thinking(metadata: Mapping[str, Any] | None) -> bool:
+    normalized = dict(metadata or {})
+    return (
+        normalized.get("kind") == "runtime_v2_intermediate_assistant"
+        and bool(str(normalized.get("runtime_thinking_stream_id", "") or "").strip())
+    )
+
+
 def transcript_metadata_visible(
     metadata: Mapping[str, Any] | None,
     *,
@@ -41,6 +49,10 @@ def transcript_metadata_visible(
         return True
     normalized_metadata = dict(metadata or {})
     if normalized_metadata.get("company_final_turn") is True:
+        return True
+    # The UI projects these task-mode rows as thinking-only entries in summary
+    # view. Company raw turns keep their existing visibility boundary.
+    if has_iteration_thinking(normalized_metadata):
         return True
     kind = str(normalized_metadata.get("kind", "") or "").strip()
     return kind not in FULL_DETAIL_ONLY_TRANSCRIPT_KINDS
@@ -63,6 +75,9 @@ def transcript_visibility_sql(
     predicate = (
         "AND (COALESCE(json_extract("
         f"{metadata_column}, '$.company_final_turn'), 0) = 1 "
+        "OR (json_extract("
+        f"{metadata_column}, '$.kind') = 'runtime_v2_intermediate_assistant' "
+        f"AND trim(COALESCE(json_extract({metadata_column}, '$.runtime_thinking_stream_id'), '')) != '') "
         "OR COALESCE(json_extract("
         f"{metadata_column}, '$.kind'), '') NOT IN ({placeholders})) "
     )
